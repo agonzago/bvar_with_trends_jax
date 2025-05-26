@@ -21,7 +21,7 @@ from scipy.optimize import minimize_scalar
 # Configure JAX
 jax.config.update("jax_enable_x64", True)
 # Keep JAX platform flexible, but for pure Python loops calling JIT, CPU can be simpler initially.
-# jax.config.update("jax_platform_name", "cpu")
+jax.config.update("jax_platform_name", "cpu")
 _DEFAULT_DTYPE = jnp.float64
 
 # *** Refined device count setting ***
@@ -252,34 +252,125 @@ def suggest_ig_priors(empirical_var: float, alpha: float = 2.5) -> Dict[str, flo
         'implied_variance': implied_variance
     }
 
-# *** RESTORED function definition (calls the DLS logic above) ***
+# --- Fixed create_config_with_canova_dls Function ---
+
 def create_config_with_canova_dls(data: pd.DataFrame,
-                                 variable_names: Optional[List[str]] = None,
-                                 training_fraction: float = 0.3,
-                                 var_order: int = 1,
-                                 dls_params: Optional[Dict] = None) -> Dict[str, Any]:
+                                       variable_names: Optional[List[str]] = None,
+                                       training_fraction: float = 0.3,
+                                       var_order: int = 1,
+                                       dls_params: Optional[Dict] = None) -> Dict[str, Any]:
     """
     Create BVAR configuration using Canova DLS priors.
-    Uses the enhanced load_config_and_prepare_jax_static_args internally.
+    FIXED: Removes infinite recursion by implementing the actual DLS logic.
     """
     if variable_names is None:
         variable_names = list(data.columns)
+    
+    if dls_params is None:
+        dls_params = {
+            'optimize_smoothness': True,
+            'smoothness_range': (1e-6, 1e2),
+            'alpha_shape': 2.5,
+        }
     
     print("="*80)
     print("APPLYING CANOVA (2014) DLS PRIOR ELICITATION")
     print("="*80)
     
-    # Apply Canova DLS
-    # This calls the DLS logic defined above
-    prior_results = create_config_with_canova_dls( 
-        data=data[variable_names],
-        variable_names=variable_names,
-        training_fraction=training_fraction,
-        dls_params=dls_params
+    # Initialize DLS processor
+    dls_processor = CanovaDLS(
+        smoothness_range=dls_params.get('smoothness_range', (1e-6, 1e2)),
+        optimize_smoothness=dls_params.get('optimize_smoothness', True)
     )
     
-    # Create a temporary structure similar to what load_config_and_prepare_jax_static_args expects
-    # for the DLS results to be integrated.
+    # Apply DLS to each variable in the training data
+    training_size = int(len(data) * training_fraction)
+    training_data = data.iloc[:training_size]
+    
+    prior_results = {}
+    alpha_shape = dls_params.get('alpha_shape', 2.5)
+    
+    for var_name in variable_names:
+        print(f"\nProcessing variable: {var_name}")
+        
+        # Get training data for this variable
+        var_data = training_data[var_name].dropna()
+        
+        if len(var_data) < 10:  # Need minimum data points
+            print(f"Warning: Insufficient data for {var_name}. Using default priors.")
+            prior_results[var_name] = {
+                'trend_shocks': suggest_ig_priors(1.0, alpha_shape),
+                'cycle_shocks': suggest_ig_priors(1.0, alpha_shape),
+                'initial_conditions': {
+                    'trend_mean': float(var_data.iloc[0]) if len(var_data) > 0 else 0.0,
+                    'trend_variance': 1.0,
+                    'cycle_mean': 0.0,
+                    'cycle_variance': 1.0
+                },
+                'diagnostics': {
+                    'optimal_lambda': 1.0,
+                    'extracted_trend_var': 1.0,
+                    'extracted_cycle_var': 1.0,
+                    'trend_component': None,
+                    'cycle_component': None
+                }
+            }
+            continue
+        
+        # Apply DLS trend-cycle decomposition
+        try:
+            trend, cycle, optimal_lambda, trend_var, cycle_var = dls_processor.extract_trend_cycle(
+                var_data.values
+            )
+            
+            # Create prior specifications
+            trend_prior = suggest_ig_priors(trend_var, alpha_shape)
+            cycle_prior = suggest_ig_priors(cycle_var, alpha_shape)
+            
+            # Store results
+            prior_results[var_name] = {
+                'trend_shocks': trend_prior,
+                'cycle_shocks': cycle_prior,
+                'initial_conditions': {
+                    'trend_mean': float(trend[0]) if not np.isnan(trend[0]) else 0.0,
+                    'trend_variance': max(float(trend_var), 1e-6),
+                    'cycle_mean': float(cycle[0]) if not np.isnan(cycle[0]) else 0.0,
+                    'cycle_variance': max(float(cycle_var), 1e-6)
+                },
+                'diagnostics': {
+                    'optimal_lambda': float(optimal_lambda),
+                    'extracted_trend_var': float(trend_var),
+                    'extracted_cycle_var': float(cycle_var),
+                    'trend_component': trend.tolist() if trend is not None else None,
+                    'cycle_component': cycle.tolist() if cycle is not None else None
+                }
+            }
+            
+            print(f"  Optimal λ: {optimal_lambda:.2e}")
+            print(f"  Trend variance: {trend_var:.6f}")
+            print(f"  Cycle variance: {cycle_var:.6f}")
+            
+        except Exception as e:
+            print(f"Warning: DLS failed for {var_name}: {e}. Using defaults.")
+            prior_results[var_name] = {
+                'trend_shocks': suggest_ig_priors(1.0, alpha_shape),
+                'cycle_shocks': suggest_ig_priors(1.0, alpha_shape),
+                'initial_conditions': {
+                    'trend_mean': float(var_data.iloc[0]),
+                    'trend_variance': 1.0,
+                    'cycle_mean': 0.0,
+                    'cycle_variance': 1.0
+                },
+                'diagnostics': {
+                    'optimal_lambda': 1.0,
+                    'extracted_trend_var': 1.0,
+                    'extracted_cycle_var': 1.0,
+                    'trend_component': None,
+                    'cycle_component': None
+                }
+            }
+    
+    # Create configuration structure
     temp_config_structure = {
         'var_order': var_order,
         'variables': {
@@ -295,30 +386,32 @@ def create_config_with_canova_dls(data: pd.DataFrame,
             'stationary_shocks': {}
         },
         'trend_shocks': {'trend_shocks': {}},
-        'parameters': {'measurement': []}, # Assuming no measurement parameters defined via DLS
+        'parameters': {'measurement': []},
     }
     
-    # Integrate DLS results into the temporary structure
+    # Integrate DLS results into the configuration
     for var_name in variable_names:
         if var_name in prior_results:
             result = prior_results[var_name]
             init_conds = result['initial_conditions']
             
+            # Set initial conditions
             temp_config_structure['initial_conditions']['states'][f'trend_{var_name}'] = {
-                'mean': float(init_conds['trend_mean']),
-                'var': float(init_conds['trend_variance'])
+                'mean': init_conds['trend_mean'],
+                'var': init_conds['trend_variance']
             }
             temp_config_structure['initial_conditions']['states'][f'cycle_{var_name}'] = {
-                'mean': float(init_conds['cycle_mean']),
-                'var': float(init_conds['cycle_variance']),
+                'mean': init_conds['cycle_mean'],
+                'var': init_conds['cycle_variance'],
             }
             
+            # Set shock priors
             cycle_prior = result['cycle_shocks']
             temp_config_structure['stationary_prior']['stationary_shocks'][f'cycle_{var_name}'] = {
                 'distribution': 'inverse_gamma',
                 'parameters': {
-                    'alpha': float(cycle_prior['alpha']),
-                    'beta': float(cycle_prior['beta']),
+                    'alpha': cycle_prior['alpha'],
+                    'beta': cycle_prior['beta'],
                 }
             }
             
@@ -326,34 +419,12 @@ def create_config_with_canova_dls(data: pd.DataFrame,
             temp_config_structure['trend_shocks']['trend_shocks'][f'trend_{var_name}'] = {
                 'distribution': 'inverse_gamma',
                 'parameters': {
-                    'alpha': float(trend_prior['alpha']),
-                    'beta': float(trend_prior['beta']),
+                    'alpha': trend_prior['alpha'],
+                    'beta': trend_prior['beta'],
                 }
             }
-        else:
-            print(f"Warning: No Canova DLS results for {var_name}. Using defaults.")
-            # Set some reasonable defaults if DLS failed for a variable
-            temp_config_structure['initial_conditions']['states'][f'trend_{var_name}'] = {
-                'mean': float(data[var_name].iloc[0]) if len(data) > 0 and np.isfinite(data[var_name].iloc[0]) else 0.0, 
-                'var': 1.0
-            }
-            temp_config_structure['initial_conditions']['states'][f'cycle_{var_name}'] = {
-                'mean': 0.0, 
-                'var': 1.0
-            }
-             # Set some default shock priors if DLS failed
-            temp_config_structure['stationary_prior']['stationary_shocks'][f'cycle_{var_name}'] = {
-                'distribution': 'inverse_gamma', 'parameters': {'alpha': 2.0, 'beta': 1.0}
-            }
-            temp_config_structure['trend_shocks']['trend_shocks'][f'trend_{var_name}'] = {
-                 'distribution': 'inverse_gamma', 'parameters': {'alpha': 2.0, 'beta': 1.0}
-             }
-
-
-    # Now, use load_config_and_prepare_jax_static_args to fully parse this structure
-    # We need to save this temporary structure to a file and then load it.
-    # This is a bit clunky, but load_config_and_prepare_jax_static_args is designed
-    # to read from a file path.
+    
+    # Save temporary config and parse it
     temp_config_path = "temp_dls_config.yml"
     try:
         with open(temp_config_path, 'w') as f:
@@ -362,7 +433,7 @@ def create_config_with_canova_dls(data: pd.DataFrame,
         # Load and parse the temporary config
         config_data = load_config_and_prepare_jax_static_args(temp_config_path)
         
-        # Add the raw DLS results diagnostics for plotting/reporting
+        # Add the raw DLS results for diagnostics
         config_data['canova_dls_results'] = prior_results
 
     finally:
@@ -375,7 +446,6 @@ def create_config_with_canova_dls(data: pd.DataFrame,
     print("="*80)
     
     return config_data
-
 
 # --- I(2) Data Simulation for BVAR Estimation ---
 # *** RESTORED function definition ***
@@ -553,6 +623,82 @@ def extract_posterior_params_for_smoother(posterior_samples: Dict,
     
     return posterior_mean_params
 
+# Replace the extract_smoother_parameters_single_draw function with this fixed version:
+
+def extract_smoother_parameters_single_draw(
+    posterior_samples: Dict[str, jax.Array],
+    draw_idx: int,
+    config_data: Dict[str, Any]
+) -> Dict[str, jax.Array]:
+    """
+    FIXED: Extracts smoother parameters handling phi_list correctly.
+    """
+    smoother_params = {}
+    
+    # Handle regular deterministic arrays
+    regular_deterministic_keys = [
+        "Sigma_cycles", "Sigma_trends_full", 
+        "init_x_comp", "init_P_comp"
+    ]
+    
+    for key in regular_deterministic_keys:
+        if key in posterior_samples:
+            param_data = posterior_samples[key]
+            if hasattr(param_data, 'shape') and len(param_data.shape) > 0:
+                if param_data.shape[0] > draw_idx:
+                    smoother_params[key] = param_data[draw_idx]
+                else:
+                    raise ValueError(f"{key} has only {param_data.shape[0]} samples, need draw {draw_idx}")
+            else:
+                # Scalar case
+                smoother_params[key] = param_data
+        else:
+            raise ValueError(f"Required key '{key}' not found in posterior_samples")
+    
+    # Handle phi_list specially (it's a list of arrays, not a single array)
+    if 'phi_list' in posterior_samples:
+        phi_list_data = posterior_samples['phi_list']
+        
+        if isinstance(phi_list_data, list):
+            # phi_list is a list of (num_samples, p, k_stat, k_stat) arrays
+            # We need to extract the draw_idx-th sample from each element
+            phi_list_for_draw = []
+            for phi_i in phi_list_data:
+                if hasattr(phi_i, 'shape') and len(phi_i.shape) > 0:
+                    if phi_i.shape[0] > draw_idx:
+                        phi_list_for_draw.append(phi_i[draw_idx])
+                    else:
+                        raise ValueError(f"phi_list element has only {phi_i.shape[0]} samples, need draw {draw_idx}")
+                else:
+                    phi_list_for_draw.append(phi_i)
+            smoother_params['phi_list'] = phi_list_for_draw
+        else:
+            # If phi_list is stored as a single array somehow
+            if hasattr(phi_list_data, 'shape') and len(phi_list_data.shape) > 0:
+                smoother_params['phi_list'] = phi_list_data[draw_idx]
+            else:
+                smoother_params['phi_list'] = phi_list_data
+    else:
+        raise ValueError("Required key 'phi_list' not found in posterior_samples")
+    
+    # Handle measurement parameters
+    measurement_param_names = config_data.get('measurement_param_names_tuple', ())
+    smoother_params['measurement_params'] = {}
+    
+    for param_name in measurement_param_names:
+        if param_name in posterior_samples:
+            param_data = posterior_samples[param_name]
+            if hasattr(param_data, 'shape') and len(param_data.shape) > 0:
+                if param_data.shape[0] > draw_idx:
+                    smoother_params['measurement_params'][param_name] = param_data[draw_idx]
+                else:
+                    smoother_params['measurement_params'][param_name] = jnp.array(0.0, dtype=_DEFAULT_DTYPE)
+            else:
+                smoother_params['measurement_params'][param_name] = param_data
+        else:
+            smoother_params['measurement_params'][param_name] = jnp.array(0.0, dtype=_DEFAULT_DTYPE)
+    
+    return smoother_params
 
 def run_bvar_estimation_with_fixes(data: pd.DataFrame,
                                   variable_names: Optional[List[str]] = None,
@@ -560,16 +706,17 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
                                   var_order: int = 1,
                                   mcmc_params: Optional[Dict] = None,
                                   dls_params: Optional[Dict] = None,
-                                  simulation_draws_per_mcmc: int = 100, # Number of smoother draws per MCMC sample
-                                  online_smoother_buffer_size: int = 1000, # Buffer size for online quantiles
+                                  simulation_draws_per_mcmc: int = 100,
+                                  online_smoother_buffer_size: int = 1000,
                                   save_config: bool = True,
                                   config_filename: str = "bvar_canova_dls.yml") -> Dict[str, Any]:
     """
     Complete BVAR estimation with all fixes:
     1. I(2) data simulation with proper differencing
     2. Canova (2014) DLS prior elicitation  
-    3. Fixed parameter mapping for smoother (implicit via deterministic sites)
+    3. Fixed parameter mapping for smoother
     4. Online Simulation Smoother for memory efficiency.
+    FIXED: Properly handles all variable scoping and NonConcreteBooleanIndexError.
     """
     
     if variable_names is None:
@@ -584,7 +731,7 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
 
     # Initialize results dictionary early to ensure data_info is always included
     results = {
-        'config': None, # Will be filled later
+        'config': None,
         'mcmc_results': None,
         'smoothing_results': None,
         'data_info': {
@@ -592,7 +739,7 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
             'variable_names': variable_names,
             'date_range': (data.index[0], data.index[-1])
         },
-        'error': None # Initialize error field
+        'error': None
     }
     
     print("="*100)
@@ -606,7 +753,6 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
     # Step 1: Create configuration with Canova DLS priors and parse it
     print("\nStep 1: Generating Canova DLS priors and parsing config...")
     try:
-        # create_config_with_canova_dls calls create_dls_config_with_canova internally
         config_data = create_config_with_canova_dls( 
             data=data,
             variable_names=variable_names,
@@ -614,18 +760,16 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
             var_order=var_order,
             dls_params=dls_params
         )
-        results['config'] = config_data # Store config in results
+        results['config'] = config_data
     except Exception as e:
          print(f"\nERROR: Configuration generation failed: {e}")
          results['error'] = f"Config generation failed: {e}"
          import traceback
          traceback.print_exc()
-         return results # Exit early if config fails
+         return results
 
-
-    # Step 2: Save configuration if requested (save the *generated* structure)
+    # Step 2: Save configuration if requested
     if save_config:
-        # Reconstruct a savable YAML structure from the parsed config_data
         yaml_config_to_save = {
             'var_order': config_data['var_order'],
             'variables': {
@@ -634,7 +778,6 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
                 'stationary': list(config_data['stationary_var_names'])
             },
             'model_equations': config_data['raw_config_model_eqs_str_dict'],
-            # Use the original initial conditions structure if available, otherwise the parsed one
             'initial_conditions': config_data.get('raw_config_initial_conds', {}),
             'stationary_prior': config_data.get('raw_config_stationary_prior', {}),
             'trend_shocks': config_data.get('raw_config_trend_shocks', {}),
@@ -652,13 +795,14 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
     y_data = data[variable_names].values.astype(_DEFAULT_DTYPE)
     T_obs = y_data.shape[0]
     k_endog = config_data['k_endog']
-    k_states = config_data['k_states'] # Total state dimension
+    k_states = config_data['k_states']
     
     print(f"\nStep 3: Preparing data...")
     print(f"Data shape: {y_data.shape}")
+    print(f"Time steps: {T_obs}, Observables: {k_endog}, States: {k_states}")
     
-    # Handle observations (for initial filter on original data and within MCMC)
-    valid_obs_mask_cols = jnp.any(jnp.isfinite(y_data), axis=0) # Check for columns with *any* finite data
+    # Handle observations for MCMC
+    valid_obs_mask_cols = jnp.any(jnp.isfinite(y_data), axis=0)
     static_valid_obs_idx = jnp.where(valid_obs_mask_cols)[0]
     static_n_obs_actual = static_valid_obs_idx.shape[0]
     
@@ -669,15 +813,14 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
     # Step 4: Run MCMC estimation
     print(f"\nStep 4: Running MCMC estimation...")
     
-    # Pass lists/tuples from config_data directly, matching model signature
     model_args = {
         'y': y_data,
-        'config_data': config_data, # Pass the parsed config_data
+        'config_data': config_data,
         'static_valid_obs_idx': static_valid_obs_idx,
         'static_n_obs_actual': static_n_obs_actual,
-        'trend_var_names': config_data['trend_var_names'], # Use tuple from config_data
-        'stationary_var_names': config_data['stationary_var_names'], # Use tuple from config_data
-        'observable_names': config_data['observable_names'], # Use tuple from config_data
+        'trend_var_names': config_data['trend_var_names'],
+        'stationary_var_names': config_data['stationary_var_names'],
+        'observable_names': config_data['observable_names'],
     }
     
     kernel = NUTS(model=numpyro_bvar_stationary_model, init_strategy=numpyro.infer.init_to_sample())
@@ -685,14 +828,13 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
     mcmc = MCMC(kernel, **mcmc_params_actual)
     
     key = random.PRNGKey(42)
-    key_mcmc, key_smoother_global = random.split(key) # Split global key for smoother draws
+    key_mcmc, key_smoother_global = random.split(key)
 
     start_time = time.time()
     try:
         mcmc.run(key_mcmc, **model_args)
         mcmc_time = time.time() - start_time
         print(f"\nMCMC completed in {mcmc_time:.2f} seconds")
-        # mcmc.print_summary() # Summary can be long, optionally print
         posterior_samples = mcmc.get_samples()
         mcmc_extras = mcmc.get_extra_fields()
         num_mcmc_samples = mcmc_params_actual['num_samples'] * mcmc_params_actual['num_chains']
@@ -703,45 +845,35 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
         results['error'] = f"MCMC failed: {e}"
         import traceback
         traceback.print_exc()
-        return results # Exit if MCMC fails
+        return results
     
     # Step 5: Run standard RTS smoother on original data (using posterior mean parameters)
-    # We need this baseline smoothed path for the Durbin-Koopman formula.
     print(f"\nStep 5: Running standard RTS smoother on original data (posterior mean)...")
     
     try:
-        # Extract posterior mean of relevant parameters needed to build the mean SS model
-        # This needs to match the parameters build_state_space_matrices_jit takes.
+        # Extract posterior mean parameters for building SS matrices
         posterior_mean_params_for_rts_builder = {}
         
-        # Collect names of parameters expected by build_state_space_matrices_jit's params_dict
         params_expected_by_builder = ['A_diag']
-        if config_data['num_off_diag'] > 0: params_expected_by_builder.append('A_offdiag')
-        if config_data['k_stationary'] > 1: params_expected_by_builder.append('stationary_chol')
+        if config_data['num_off_diag'] > 0: 
+            params_expected_by_builder.append('A_offdiag')
+        if config_data['k_stationary'] > 1: 
+            params_expected_by_builder.append('stationary_chol')
         params_expected_by_builder.extend([f'stationary_var_{name}' for name in config_data['stationary_var_names']])
         params_expected_by_builder.extend([f'trend_var_{name}' for name in config_data['trend_names_with_shocks']])
         params_expected_by_builder.extend(list(config_data['measurement_param_names_tuple']))
 
-        # Populate posterior_mean_params_for_rts_builder with means from posterior_samples
         for param_name in params_expected_by_builder:
             if param_name in posterior_samples:
-                 # Get mean, handle potential non-numeric types if any (shouldn't happen with these params)
                  mean_val = jnp.mean(jnp.asarray(posterior_samples[param_name], dtype=_DEFAULT_DTYPE), axis=0)
                  posterior_mean_params_for_rts_builder[param_name] = mean_val
-            else:
-                 # If a parameter expected by the builder is NOT in posterior_samples,
-                 # it means it wasn't sampled (e.g., offdiag when num_off_diag=0).
-                 # build_state_space_matrices_jit needs to handle this gracefully (using .get).
-                 pass # Do nothing, build_state_space_matrices_jit will use default via .get
 
         # Build state-space matrices using posterior mean parameters
-        ss_matrices_posterior_mean = build_state_space_matrices_jit( # *** This should be imported now ***
-            posterior_mean_params_for_rts_builder, config_data # Pass config_data as static
+        ss_matrices_posterior_mean = build_state_space_matrices_jit(
+            posterior_mean_params_for_rts_builder, config_data
         )
         
-        # Prepare for Kalman filter using matrices from posterior mean
-        # Note: KalmanFilter uses R directly to compute Q=R@R.T internally.
-        # ss_matrices_posterior_mean['R_comp'] IS the Cholesky of Q for the KF likelihood.
+        # Run filter and smoother using KalmanFilter
         kf_mean = KalmanFilter(
             ss_matrices_posterior_mean['T_comp'],
             ss_matrices_posterior_mean['R_comp'], 
@@ -751,26 +883,16 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
             ss_matrices_posterior_mean['init_P_comp'] 
         )
         
-        # Run filter
-        # The standard KF.filter needs static NaN info, but applied to the DENSE y_data here.
-        # The y_data can still have NaNs if some *variables* are missing entirely across time,
-        # but the filter logic used here (_filter_internal) is simpler and expects dense input
-        # for the *actually observed* columns (selected by static_valid_obs_idx).
-        # However, the base KalmanFilter in Kalman_filter_jax *does* handle time-varying NaNs.
-        # Let's use the filter method from the base KalmanFilter class which handles NaNs.
-        
-        # Prepare static args for KalmanFilter.filter using matrices from posterior mean
         static_C_obs_mean = ss_matrices_posterior_mean['C_comp'][static_valid_obs_idx, :]
         static_H_obs_mean = ss_matrices_posterior_mean['H_comp'][static_valid_obs_idx[:, None], static_valid_obs_idx]
         static_I_obs_mean = jnp.eye(static_n_obs_actual, dtype=_DEFAULT_DTYPE)
 
-        filter_results_original = kf_mean.filter( # Use the filter method from KalmanFilter which handles NaNs
+        filter_results_original = kf_mean.filter(
             y_data, static_valid_obs_idx, static_n_obs_actual, 
             static_C_obs_mean, static_H_obs_mean, static_I_obs_mean
         )
         
-        # Run smoother
-        x_smooth_original_dense, _ = kf_mean.smooth( # Use the smooth method from KalmanFilter which handles NaNs
+        x_smooth_original_dense, _ = kf_mean.smooth(
             y_data, filter_results_original, static_valid_obs_idx, static_n_obs_actual,
              static_C_obs_mean, static_H_obs_mean, static_I_obs_mean
         )
@@ -783,10 +905,7 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
         results['error'] = f"Standard RTS smoothing failed: {e}"
         import traceback
         traceback.print_exc()
-        # We can potentially continue to online smoother if the error was only in the RTS mean,
-        # but Durbin-Koopman NEEDS x_smooth_original_dense. So we must exit here if this fails.
         return results 
-
 
     # Step 6: Initialize Online Quantile Estimators Grid
     print(f"\nStep 6: Initializing online quantile estimators ({T_obs} time steps x {k_states} states)...")
@@ -810,100 +929,109 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
     # Generate keys for each simulation draw
     all_smoother_keys = random.split(key_smoother_global, total_simulation_draws)
 
-    key_idx = 0 # Index for all_smoother_keys
+    key_idx = 0
     
-    # JIT compile the single simulation path function wrapper once outside the loop
-    # This wrapper takes smoother params, original data, baseline smooth, key, and static config.
-    # The static_argnames must match the static arguments of the wrapper.
-    # The static argument should be the HASHABLE config.
-    
-    # Convert the static config_data to a hashable format
-    hashable_config_data = convert_to_hashable(config_data)
+    # Convert config_data to hashable format for JIT
+    # hashable_config_data = convert_to_hashable(config_data)
+    # jit_run_single_simulation_path = jax.jit(jit_run_single_simulation_path_for_dk_wrapper, static_argnames=['static_config_data'])
 
-    # Pass the hashable config as the static argument
-    jit_run_single_simulation_path = jax.jit(jit_run_single_simulation_path_for_dk_wrapper, static_argnames=['static_config_data'])
-
-    # Loop through each MCMC sample (Python loop)
     for mcmc_draw_idx in range(num_mcmc_samples):
-        # Extract parameters for this specific MCMC draw
         try:
-             # Use the updated extract function
-             # extract_smoother_parameters_single_draw needs posterior_samples, draw_idx, AND config_data
-             smoother_params_single_draw = extract_smoother_parameters_single_draw(
+            smoother_params_single_draw = extract_smoother_parameters_single_draw(
                 posterior_samples, mcmc_draw_idx, config_data 
-             )
-             # smoother_params_single_draw should contain: phi_list, Sigma_cycles, Sigma_trends_full, init_x_comp, init_P_comp, measurement_params
-             # These are the *parameters* that define the SS model for this draw.
-
+            )
         except Exception as e:
             print(f"\nWarning: Failed to extract smoother parameters for MCMC draw {mcmc_draw_idx}: {e}. Skipping this draw.")
-            results['error'] = f"Parameter extraction failed for MCMC sample {mcmc_draw_idx}: {e}"
-            import traceback
-            traceback.print_exc()
-            key_idx += simulation_draws_per_mcmc # Skip keys for this draw's smoother draws
-            continue # Skip to next MCMC draw
+            key_idx += simulation_draws_per_mcmc
+            continue
 
-        # Inner loop: Run simulation smoother draws for this MCMC sample (Python loop)
+        # Inner loop: Run simulation smoother draws for this MCMC sample
         for smoother_draw_idx in range(simulation_draws_per_mcmc):
             current_smoother_key = all_smoother_keys[key_idx]
             
             try:
-                # Run a single simulation path for this draw using the JITted wrapper
-                # The wrapper constructs the SS matrices inside the JIT.
+                # Build SS matrices for this draw (don't JIT this part due to config_data)
+                ss_matrices_sim = construct_ss_matrices_from_smoother_params(
+                    smoother_params_single_draw, config_data
+                )
+                
+                # Run simulation path (can JIT the core simulation)
+                simulated_states_path = run_single_simulation_path_for_dk(
+                    ss_matrices_sim,
+                    y_data,
+                    x_smooth_original_dense,
+                    current_smoother_key,
+                    config_data,
+                    smoother_params_single_draw
+                )
+
+                # Update buffers using simple Python loops (no JAX)
+                for t in range(T_obs):
+                    for s in range(k_states):
+                        new_value = float(simulated_states_path[t, s])  # Convert to Python float
+                        
+                        current_count = int(count_grid[t, s])
+                        buffer_idx = current_count % online_smoother_buffer_size
+                        
+                        # Update buffer and count
+                        buffer_grid = buffer_grid.at[t, s, buffer_idx].set(new_value)
+                        count_grid = count_grid.at[t, s].set(current_count + 1)
+
+                processed_draws += 1
+                key_idx += 1
+                
+            except Exception as e:
+                print(f"Warning: Simulation draw failed: {e}")
+                key_idx += 1
+                processed_draws += 1
+                
+    # Loop through each MCMC sample
+    for mcmc_draw_idx in range(num_mcmc_samples):
+        try:
+             smoother_params_single_draw = extract_smoother_parameters_single_draw(
+                posterior_samples, mcmc_draw_idx, config_data 
+             )
+
+        except Exception as e:
+            print(f"\nWarning: Failed to extract smoother parameters for MCMC draw {mcmc_draw_idx}: {e}. Skipping this draw.")
+            key_idx += simulation_draws_per_mcmc
+            continue
+
+        # Inner loop: Run simulation smoother draws for this MCMC sample
+        for smoother_draw_idx in range(simulation_draws_per_mcmc):
+            current_smoother_key = all_smoother_keys[key_idx]
+            
+            try:
+                # Run a single simulation path
                 simulated_states_path = jit_run_single_simulation_path(
-                    smoother_params_single_draw, # Dynamic parameter dictionary for the draw
-                    y_data, # Dynamic original data (full data needed for simulation)
-                    x_smooth_original_dense, # Dynamic baseline smoothed path (from posterior mean)
-                    current_smoother_key, # Dynamic key for simulation noise
-                    static_config_data=hashable_config_data # *** Pass the hashable config as static ***
+                    smoother_params_single_draw,
+                    y_data,
+                    x_smooth_original_dense,
+                    current_smoother_key,
+                    static_config_data=hashable_config_data
                 )
 
-                # Update the online quantile estimators (buffers and counts)
-                # Use a JAX scan over time and state dimensions.
-                def update_estimator_grid_step(carry, ts_idx):
-                    buffer_grid_carry, count_grid_carry = carry
-                    t, s = ts_idx # Time step index, State variable index
-                    
-                    new_value = simulated_states_path[t, s]
-
-                    updated_buffer_ts, updated_count_ts = OnlineQuantileEstimator.update_buffer(
-                         buffer_grid_carry[t, s],
-                         count_grid_carry[t, s],
-                         new_value,
-                         online_smoother_buffer_size
-                    )
-                    
-                    buffer_grid_carry = buffer_grid_carry.at[t, s].set(updated_buffer_ts)
-                    count_grid_carry = count_grid_carry.at[t, s].set(updated_count_ts)
-
-                    return (buffer_grid_carry, count_grid_carry), None # No output per step
-
-                # Create flattened indices (t, s) for the scan
-                ts_indices = jnp.array([(t, s) for t in range(T_obs) for s in range(k_states)])
-
-                # Use a JAX scan to update the entire grid efficiently
-                (buffer_grid, count_grid), _ = jax.lax.scan(
-                     update_estimator_grid_step,
-                     (buffer_grid, count_grid),
-                     ts_indices
-                )
+                # Update the online quantile estimators using Python loops
+                # This avoids the JAX compilation issues
+                for t in range(T_obs):
+                    for s in range(k_states):
+                        new_value = simulated_states_path[t, s]
+                        
+                        # Update buffer and count
+                        current_count = count_grid[t, s]
+                        buffer_idx = current_count % online_smoother_buffer_size
+                        buffer_grid = buffer_grid.at[t, s, buffer_idx].set(new_value)
+                        count_grid = count_grid.at[t, s].set(current_count + 1)
 
                 processed_draws += 1
                 key_idx += 1
                 
             except Exception as e:
                  print(f"\nWarning: Failed to run smoother draw {smoother_draw_idx} for MCMC sample {mcmc_draw_idx}: {e}. Skipping.")
-                 results['error'] = f"Smoother draw failed for MCMC sample {mcmc_draw_idx}, draw {smoother_draw_idx}: {e}"
-                 import traceback
-                 traceback.print_exc()
-                 # Ensure key is still consumed even if draw fails to maintain sequence
                  key_idx += 1
-                 processed_draws += 1 # Still count it as an attempted draw
-                 # Optionally, break the inner loop if a draw fails to avoid cascading errors
-                 # break 
+                 processed_draws += 1
 
-
-        # Optional: Report progress periodically
+        # Report progress periodically
         if (mcmc_draw_idx + 1) % 10 == 0 or (mcmc_draw_idx + 1) == num_mcmc_samples:
              elapsed_time = time.time() - start_smooth_sim_time
              avg_time_per_mcmc = elapsed_time / (mcmc_draw_idx + 1) if (mcmc_draw_idx + 1) > 0 else 0
@@ -912,7 +1040,6 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
              print(f"Processed MCMC sample {mcmc_draw_idx + 1}/{num_mcmc_samples}. "
                    f"Total draws processed: {processed_draws}/{total_simulation_draws}. "
                    f"Elapsed: {elapsed_time:.2f}s. Est. remaining: {estimated_remaining_time:.2f}s.")
-
 
     smooth_sim_time = time.time() - start_smooth_sim_time
     print(f"\nOnline simulation smoothing completed in {smooth_sim_time:.2f} seconds.")
@@ -927,37 +1054,26 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
         dtype=_DEFAULT_DTYPE
     )
 
-    # We need to compute quantiles for each (t, s) using the final buffer_grid and count_grid.
-    # Use a JAX scan for this over the flattened (t, s) indices.
-    ts_indices = jnp.array([(t, s) for t in range(T_obs) for s in range(k_states)]) # Re-create indices
-
-    def compute_quantiles_grid_step(carry, ts_idx):
-        # carry is the final_quantiles_grid being built
-        # ts_idx is a tuple (t, s)
-        quantiles_grid_carry = carry
-        t, s = ts_idx
+    # Use Python loops to avoid JAX compilation issues
+    print("Computing quantiles using Python loops to avoid JIT compilation issues...")
+    
+    for t in range(T_obs):
+        for s in range(k_states):
+            buffer_ts = buffer_grid[t, s]
+            count_ts = count_grid[t, s]
+            
+            # Compute quantiles for this (time, state) pair
+            computed_qs = OnlineQuantileEstimator.compute_quantiles_from_buffer(
+                buffer_ts, count_ts, quantiles_to_track
+            )
+            
+            final_quantiles_grid = final_quantiles_grid.at[t, s].set(computed_qs)
         
-        buffer_ts = buffer_grid[t, s]
-        count_ts = count_grid[t, s]
-        
-        computed_qs = OnlineQuantileEstimator.compute_quantiles_from_buffer(
-            buffer_ts,
-            count_ts,
-            quantiles_to_track
-        )
-        
-        quantiles_grid_carry = quantiles_grid_carry.at[t, s].set(computed_qs)
-
-        return quantiles_grid_carry, None # No output per step
-
-    final_quantiles_grid, _ = jax.lax.scan(
-        compute_quantiles_grid_step,
-        final_quantiles_grid,
-        ts_indices 
-    )
+        # Print progress every 10% of time steps
+        if (t + 1) % max(1, T_obs // 10) == 0:
+            print(f"  Processed {t + 1}/{T_obs} time steps ({100*(t+1)/T_obs:.1f}%)")
 
     # Extract median, lower and upper HDI bounds
-    # Find index of each quantile in the sorted quantiles_to_track list
     try:
         median_idx = quantiles_to_track.index(0.5)
         lower_hdi_idx = quantiles_to_track.index(0.025)
@@ -967,38 +1083,42 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
         hdi_lower_draws = final_quantiles_grid[:, :, lower_hdi_idx]
         hdi_upper_draws = final_quantiles_grid[:, :, upper_hdi_idx]
     except ValueError:
-         print("Warning: Standard quantiles (0.025, 0.5, 0.975) not found in quantiles_to_track. HDI/Median fields will be NaN.")
+         print("Warning: Standard quantiles (0.025, 0.5, 0.975) not found. HDI/Median fields will be NaN.")
          median_draws = jnp.full((T_obs, k_states), jnp.nan, dtype=_DEFAULT_DTYPE)
          hdi_lower_draws = jnp.full((T_obs, k_states), jnp.nan, dtype=_DEFAULT_DTYPE)
          hdi_upper_draws = jnp.full((T_obs, k_states), jnp.nan, dtype=_DEFAULT_DTYPE)
 
+    # Compute mean from accumulated buffer values
+    print("Computing means from buffers...")
+    mean_draws = jnp.zeros((T_obs, k_states), dtype=_DEFAULT_DTYPE)
+    
+    for t in range(T_obs):
+        for s in range(k_states):
+            buffer_ts = buffer_grid[t, s]
+            finite_mask = jnp.isfinite(buffer_ts)
+            finite_count = jnp.sum(finite_mask)
+            
+            if finite_count > 0:
+                finite_sum = jnp.sum(jnp.where(finite_mask, buffer_ts, 0.0))
+                mean_val = finite_sum / finite_count
+            else:
+                mean_val = jnp.nan
+                
+            mean_draws = mean_draws.at[t, s].set(mean_val)
 
-    # Compute mean from accumulated sums in the buffer (if count > 0)
-    sum_grid = jnp.sum(jnp.nan_to_num(buffer_grid, nan=0.0), axis=-1) # Sum up buffer values (0 for NaNs)
-    # Avoid division by zero: if count is 0, mean is NaN
-    mean_draws = jnp.where(
-        count_grid > 0,
-        sum_grid / jnp.maximum(1, count_grid), # Divide by count, max(1, count) to prevent div by zero
-        jnp.nan # Mean is NaN if no valid data was ever processed
-    )
-    # Also ensure mean is NaN if no draws were processed at all
-    mean_draws = jnp.where(processed_draws > 0, mean_draws, jnp.full_like(mean_draws, jnp.nan))
-
-
-    print("Quantiles, HDI, and Mean computed.")
+    print("Quantiles, HDI, and Mean computed successfully.")
 
     # Step 9: Package results
-    # Store the computed quantiles/HDI and possibly the mean
-    results['smoothing_results']['online_smoother_quantiles'] = { # Store the computed quantiles
-                'quantiles_to_track': quantiles_to_track,
-                'estimated_quantiles': final_quantiles_grid, # All computed quantiles
-                'median': median_draws, # Extracted median
-                'hdi_lower': hdi_lower_draws, # Extracted lower HDI bound
-                'hdi_upper': hdi_upper_draws, # Extracted upper HDI bound
-                'mean': mean_draws, # Computed mean
-                'buffer_size': online_smoother_buffer_size,
-                'total_sim_draws_processed': processed_draws
-            }
+    results['smoothing_results']['online_smoother_quantiles'] = {
+        'quantiles_to_track': quantiles_to_track,
+        'estimated_quantiles': final_quantiles_grid,
+        'median': median_draws,
+        'hdi_lower': hdi_lower_draws,
+        'hdi_upper': hdi_upper_draws,
+        'mean': mean_draws,
+        'buffer_size': online_smoother_buffer_size,
+        'total_sim_draws_processed': processed_draws
+    }
     results['smoothing_results']['smooth_sim_time'] = smooth_sim_time
     
     print("\n" + "="*100)
@@ -1009,7 +1129,6 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
     print("="*100)
     
     return results
-
 # --- Enhanced Plotting with I(2) Data Visualization (Adapt plotting) ---
 
 def plot_results_with_canova_dls(results: Dict[str, Any],

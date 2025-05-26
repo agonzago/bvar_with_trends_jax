@@ -15,17 +15,17 @@ model_equations:
 initial_conditions:
   states:
     trend_gdp_growth:
-      mean: 0.012691729370316419
-      var: 0.0001929730078861807
+      mean: -0.0025013744110758272
+      var: 0.0003561948538744395
     cycle_gdp_growth:
-      mean: -0.00018201880941990522
-      var: 4.001464835014616e-05
+      mean: 0.0011154251474579245
+      var: 3.753866737945251e-05
     trend_inflation:
-      mean: 0.008601619138974628
-      var: 0.00016390497393667952
+      mean: 0.0021314546696473793
+      var: 0.0005931288820910744
     cycle_inflation:
-      mean: 0.001162872850990887
-      var: 4.0728643814294717e-05
+      mean: 0.0005831839002270376
+      var: 7.689607424893201e-05
 stationary_prior:
   hyperparameters:
     es:
@@ -53,10 +53,10 @@ trend_shocks:
       distribution: inverse_gamma
       parameters:
         alpha: 2.5
-        beta: 0.0005233897639633952
+        beta: 0.0005342922808116593
     trend_inflation:
       distribution: inverse_gamma
       parameters:
         alpha: 2.5
-        beta: 0.0008715568594575637
+        beta: 0.0008896933231366116
 parameters: []

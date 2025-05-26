@@ -1,5 +1,5 @@
-# --- smoother_utils.py (Corrected) ---
-
+# --- smoother_utils.py (Fixed NonConcreteBooleanIndexError) ---
+import numpy as np  
 import jax
 import jax.numpy as jnp
 import jax.random as random
@@ -57,56 +57,117 @@ def _get_state_indices_map(
     return state_indices
 
 
-# Step 1: Extract Smoother Parameters for Single Draw
+# # Step 1: Extract Smoother Parameters for Single Draw
+# def extract_smoother_parameters_single_draw(
+#     posterior_samples: Dict[str, jax.Array],
+#     draw_idx: int,
+#     config_data: Dict[str, Any] # Needed for parameter names etc.
+# ) -> Dict[str, jax.Array]:
+#     """
+#     Extracts the necessary parameters for the smoother from a single MCMC posterior draw.
+#     These parameters are the deterministic outputs from the NumPyro model run.
+    
+#     Extracts: phi_list, Sigma_cycles, Sigma_trends_full, init_x_comp, init_P_comp,
+#               and measurement parameters.
+#     """
+#     smoother_params = {}
+
+#     # Extract parameters from deterministic sites
+#     # These names must match the numpyro.deterministic site names in var_ss_model.py
+    
+#     required_deterministic_keys = [
+#         "phi_list", # list of p, k_stat x k_stat arrays
+#         "Sigma_cycles", # k_stat x k_stat matrix
+#         "Sigma_trends_full", # k_trends x k_trends matrix
+#         "init_x_comp", # k_states vector (mean)
+#         "init_P_comp", # k_states x k_states matrix (covariance)
+#     ]
+    
+#     for key in required_deterministic_keys:
+#         if key not in posterior_samples:
+#             raise ValueError(f"Deterministic key '{key}' not found in posterior_samples. "
+#                              "Ensure these are exposed in the NumPyro model.")
+#         # Extract the specific draw for each parameter
+#         smoother_params[key] = posterior_samples[key][draw_idx]
+
+#     # Extract measurement parameters (if any) - these are sampled parameters, not deterministics
+#     # Need names from config_data
+#     measurement_param_names_tuple = config_data['measurement_param_names_tuple']
+#     smoother_params['measurement_params'] = {} # Store as a dictionary
+    
+#     for param_name in measurement_param_names_tuple:
+#         if param_name not in posterior_samples:
+#             # This should not happen if the MCMC run was successful and the parameter exists in config
+#             print(f"Warning: Sampled measurement parameter '{param_name}' not found in posterior_samples. Using 0.0.")
+#             smoother_params['measurement_params'][param_name] = jnp.array(0.0, dtype=_DEFAULT_DTYPE)
+#         else:
+#             # Extract the specific draw for the measurement parameter
+#             smoother_params['measurement_params'][param_name] = posterior_samples[param_name][draw_idx]
+
+
+#     return smoother_params
+
+# Replace the extract_smoother_parameters_single_draw function with this debug version:
+
 def extract_smoother_parameters_single_draw(
     posterior_samples: Dict[str, jax.Array],
     draw_idx: int,
-    config_data: Dict[str, Any] # Needed for parameter names etc.
+    config_data: Dict[str, Any]
 ) -> Dict[str, jax.Array]:
     """
-    Extracts the necessary parameters for the smoother from a single MCMC posterior draw.
-    These parameters are the deterministic outputs from the NumPyro model run.
-    
-    Extracts: phi_list, Sigma_cycles, Sigma_trends_full, init_x_comp, init_P_comp,
-              and measurement parameters.
+    DEBUG VERSION: Extracts smoother parameters with detailed error reporting.
     """
-    smoother_params = {}
-
-    # Extract parameters from deterministic sites
-    # These names must match the numpyro.deterministic site names in var_ss_model.py
+    print(f"\n=== DEBUG: Extracting parameters for draw {draw_idx} ===")
+    print(f"Available keys in posterior_samples: {list(posterior_samples.keys())}")
     
+    smoother_params = {}
+    
+    # Check shapes of deterministic sites
     required_deterministic_keys = [
-        "phi_list", # list of p, k_stat x k_stat arrays
-        "Sigma_cycles", # k_stat x k_stat matrix
-        "Sigma_trends_full", # k_trends x k_trends matrix
-        "init_x_comp", # k_states vector (mean)
-        "init_P_comp", # k_states x k_states matrix (covariance)
+        "phi_list", "Sigma_cycles", "Sigma_trends_full", 
+        "init_x_comp", "init_P_comp"
     ]
     
     for key in required_deterministic_keys:
-        if key not in posterior_samples:
-            raise ValueError(f"Deterministic key '{key}' not found in posterior_samples. "
-                             "Ensure these are exposed in the NumPyro model.")
-        # Extract the specific draw for each parameter
-        smoother_params[key] = posterior_samples[key][draw_idx]
-
-    # Extract measurement parameters (if any) - these are sampled parameters, not deterministics
-    # Need names from config_data
-    measurement_param_names_tuple = config_data['measurement_param_names_tuple']
-    smoother_params['measurement_params'] = {} # Store as a dictionary
-    
-    for param_name in measurement_param_names_tuple:
-        if param_name not in posterior_samples:
-            # This should not happen if the MCMC run was successful and the parameter exists in config
-            print(f"Warning: Sampled measurement parameter '{param_name}' not found in posterior_samples. Using 0.0.")
-            smoother_params['measurement_params'][param_name] = jnp.array(0.0, dtype=_DEFAULT_DTYPE)
+        if key in posterior_samples:
+            param_shape = posterior_samples[key].shape
+            print(f"  {key}: shape = {param_shape}")
+            
+            if len(param_shape) == 0:  # Scalar
+                print(f"    ERROR: {key} is scalar, expected array with batch dimension")
+                continue
+            elif param_shape[0] <= draw_idx:
+                print(f"    ERROR: {key} has only {param_shape[0]} samples, need draw_idx={draw_idx}")
+                continue
+            else:
+                smoother_params[key] = posterior_samples[key][draw_idx]
+                print(f"    SUCCESS: Extracted {key} for draw {draw_idx}")
         else:
-            # Extract the specific draw for the measurement parameter
-            smoother_params['measurement_params'][param_name] = posterior_samples[param_name][draw_idx]
-
-
+            print(f"    ERROR: {key} not found in posterior_samples")
+    
+    # Check measurement parameters
+    measurement_param_names = config_data.get('measurement_param_names_tuple', ())
+    print(f"  Looking for measurement params: {measurement_param_names}")
+    
+    smoother_params['measurement_params'] = {}
+    for param_name in measurement_param_names:
+        if param_name in posterior_samples:
+            param_shape = posterior_samples[param_name].shape
+            print(f"    {param_name}: shape = {param_shape}")
+            
+            if len(param_shape) == 0:  # Scalar
+                smoother_params['measurement_params'][param_name] = posterior_samples[param_name]
+            elif param_shape[0] > draw_idx:
+                smoother_params['measurement_params'][param_name] = posterior_samples[param_name][draw_idx]
+            else:
+                print(f"      ERROR: {param_name} has only {param_shape[0]} samples")
+                smoother_params['measurement_params'][param_name] = jnp.array(0.0, dtype=_DEFAULT_DTYPE)
+        else:
+            print(f"      WARNING: {param_name} not found, using 0.0")
+            smoother_params['measurement_params'][param_name] = jnp.array(0.0, dtype=_DEFAULT_DTYPE)
+    
+    print(f"=== DEBUG: Successfully extracted {len(smoother_params)} parameter groups ===\n")
     return smoother_params
-
 
 # Step 2: Construct State-Space Matrices from Smoother Parameters
 #@jax.jit(static_argnames=['static_config_data']) # JIT this builder
@@ -287,68 +348,66 @@ class OnlineQuantileEstimator:
     @staticmethod
     def compute_quantiles_from_buffer(buffer: jax.Array, count: jax.Array, quantiles: List[float]):
         """
-        Static method to compute quantiles from the values currently in the buffer.
+        Compute quantiles from buffer - COMPLETELY AVOID JAX COMPILATION.
+        This runs outside any JAX context to avoid all dynamic indexing issues.
         """
-        valid_buffer_size = jnp.minimum(count, jnp.array(buffer.shape[0], dtype=jnp.int32))
-        current_values = buffer # Use the whole buffer, jnp.percentile handles NaNs initially
-
-        has_valid_values = (valid_buffer_size > 0) & jnp.any(jnp.isfinite(current_values))
+        # Convert to numpy for computation outside JAX
+        buffer_np = np.asarray(buffer)
+        count_np = int(count)
         
-        def compute_q(op):
-            values, qs = op
-            # JAX's percentile handles NaNs by ignoring them.
-            # If all values are NaN/empty after filtering, result will be NaN.
-            return jnp.percentile(values[jnp.isfinite(values)], jnp.array(qs) * 100.0) # Filter NaNs explicitly before percentile
-            
-        def return_nan_q(op):
-            qs = op
-            return jnp.full(len(qs), jnp.nan, dtype=_DEFAULT_DTYPE)
-            
-        computed_quantiles = jax.lax.cond(
-            has_valid_values,
-            compute_q,
-            return_nan_q,
-            operand=(current_values, quantiles)
-        )
-
-        return computed_quantiles
+        # Check if we have any data
+        if count_np <= 0:
+            return jnp.full(len(quantiles), jnp.nan, dtype=_DEFAULT_DTYPE)
+        
+        # Get finite values
+        finite_mask = np.isfinite(buffer_np)
+        if not np.any(finite_mask):
+            return jnp.full(len(quantiles), jnp.nan, dtype=_DEFAULT_DTYPE)
+        
+        # Extract finite values
+        finite_values = buffer_np[finite_mask]
+        
+        if len(finite_values) == 0:
+            return jnp.full(len(quantiles), jnp.nan, dtype=_DEFAULT_DTYPE)
+        
+        # Compute quantiles using numpy (outside JAX)
+        try:
+            quantile_values = np.percentile(finite_values, [q * 100 for q in quantiles])
+            return jnp.array(quantile_values, dtype=_DEFAULT_DTYPE)
+        except Exception:
+            return jnp.full(len(quantiles), jnp.nan, dtype=_DEFAULT_DTYPE)
 
 # Step 6: Single Simulation Path Function
 # This function will use the SS matrices from construct_ss_matrices_from_smoother_params.
 # This function is already defined in the previous response's smoother_utils.py block.
 # Re-include it here for clarity in the full smoother_utils.py file.
 
+# --- Fixed run_single_simulation_path_for_dk Function ---
+
 def run_single_simulation_path_for_dk(
-    ss_matrices_sim: Dict[str, jax.Array], # T, R_aug, C, H, init_x, init_P for simulation
+    ss_matrices_sim: Dict[str, jax.Array],
     original_ys_dense: jax.Array,
-    x_smooth_original_dense: jax.Array, # Smoothed states from original data (posterior mean)
+    x_smooth_original_dense: jax.Array,
     key: jax.random.PRNGKey,
-    config_data: Dict[str, Any] # For dimensions etc.
+    config_data: Dict[str, Any],
+    smoother_params_single_draw: Dict[str, jax.Array]  # ADDED: Missing parameter
 ) -> jax.Array:
     """
-    Generates a single simulation path for the Durbin-Koopman smoother using the
-    state-space model defined by ss_matrices_sim.
-    
-    Applies the D-K formula: x_draw = x_smooth_original + (x_star - x_smooth_star).
-    Assumes original_ys_dense is DENSE (no NaNs).
+    Generates a single simulation path for the Durbin-Koopman smoother.
+    FIXED: Added missing smoother_params_single_draw parameter.
     """
     T_steps = original_ys_dense.shape[0]
     n_state = ss_matrices_sim['T_comp'].shape[0]
-    # n_obs_full = ss_matrices_sim['C_comp'].shape[0] # Dimension of full observation space
-    # n_shocks_sim = ss_matrices_sim['R_aug'].shape[1] # Number of columns in R_aug
     
     if T_steps == 0:
         return jnp.empty((0, n_state), dtype=_DEFAULT_DTYPE)
 
     key_sim, key_filter_smooth = random.split(key)
 
-    # 1. Simulate a path from the state space model (x* and y*) using R_aug
-    # simulate_state_space needs (P_aug, R_aug, Omega, H_obs, init_x, init_P, key, num_steps)
-    # Here: P_aug=T_comp, R_aug=R_aug, Omega=C_comp, H_obs=H_comp, init_x=init_x_sim, init_P=init_P_sim
-    
+    # 1. Simulate a path from the state space model (x* and y*)
     x_star_path, y_star_dense_sim = simulate_state_space_raw(
         ss_matrices_sim['T_comp'],
-        ss_matrices_sim['R_aug'], # Use the R_aug for simulation!
+        ss_matrices_sim['R_aug'],
         ss_matrices_sim['C_comp'],
         ss_matrices_sim['H_comp'],
         ss_matrices_sim['init_x_sim'], 
@@ -357,38 +416,10 @@ def run_single_simulation_path_for_dk(
         T_steps
     )
 
-    # 2. Run filter and smoother on the simulated data (y_star_dense_sim)
-    # This requires a filter/smoother instance that uses the SAME state-space model
-    # defined by ss_matrices_sim (but uses R_comp @ R_comp.T for state noise cov in KF).
-    # The HybridDKSimulationSmoother is designed for this.
-
-    # Create a temporary HybridDKSimulationSmoother instance to access its internal filter/smoother
-    # Pass the necessary matrices from ss_matrices_sim. Note that HybridDK uses R directly
-    # and computes Q=R@R.T internally for the filter. The R in ss_matrices_sim is R_aug (k_states x num_shocks).
-    # HybridDK expects R to be k_states x k_shocks where R@R.T is the state noise covariance.
-    # So, we need to pass the R from the *likelihood* calculation (R_comp, k_states x k_states)
-    # to the HybridDKSimulationSmoother, NOT R_aug.
-
-    # The R_comp (k_states x k_states) should be obtainable from the original MCMC ss_matrices.
-    # Alternatively, we can compute Q_comp from Sigma_trends_full and Sigma_cycles and pass
-    # its Cholesky (k_states x k_states) as the 'R' parameter to HybridDKSimulationSmoother.
-
-    # Let's reconstruct Q_comp for the filter/smoother from Sigma_trends_full and Sigma_cycles
-    # which are available in smoother_params_single_draw.
-    # This requires accessing Sigma_cycles and Sigma_trends_full again.
-    # Maybe pass smoother_params_single_draw to this function as well?
-
-    # Revised approach: Pass smoother_params_single_draw AND ss_matrices_sim
-    # smoother_params_single_draw contains: phi_list, Sigma_cycles, Sigma_trends_full, init_x_comp, init_P_comp, measurement_params.
-    # ss_matrices_sim contains: T_comp, R_aug, C_comp, H_comp, init_x_sim, init_P_sim.
-
-    # We need Sigma_cycles and Sigma_trends_full to build the R for the filter.
-    # Let's get them from smoother_params_single_draw passed as an argument.
-    
+    # 2. Reconstruct Q_comp for the filter from parameters
     Sigma_cycles = smoother_params_single_draw['Sigma_cycles']
     Sigma_trends_full = smoother_params_single_draw['Sigma_trends_full']
     
-    # Reconstruct Q_comp for the filter from Sigma_trends_full and Sigma_cycles
     k_trends = Sigma_trends_full.shape[0]
     k_stationary = Sigma_cycles.shape[0]
     Q_comp_filter = jnp.zeros((n_state, n_state), dtype=_DEFAULT_DTYPE)
@@ -397,44 +428,37 @@ def run_single_simulation_path_for_dk(
     Q_comp_filter = (Q_comp_filter + Q_comp_filter.T) / 2.0
     Q_comp_filter = Q_comp_filter + _MODEL_JITTER * jnp.eye(n_state, dtype=_DEFAULT_DTYPE)
 
-    # R_for_filter is the Cholesky of Q_comp_filter (k_states x k_states)
+    # R_for_filter is the Cholesky of Q_comp_filter
     try:
-        R_for_filter = jsl.cholesky(Q_comp_filter, lower=True)
+        R_for_filter = jax.scipy.linalg.cholesky(Q_comp_filter, lower=True)
     except Exception:
         print("Warning: Cholesky of Q_comp_filter failed. Using diagonal sqrt.")
         R_for_filter = jnp.diag(jnp.sqrt(jnp.diag(Q_comp_filter)))
 
-    # Use the constructed R_for_filter (k_states x k_states) for HybridDKSimulationSmoother
+    # 3. Create temporary smoother and run filter/smoother on simulated data
     temp_dk_smoother = HybridDKSimulationSmoother(
         ss_matrices_sim['T_comp'],
-        R_for_filter, # Use R_for_filter (k_states x k_states)
+        R_for_filter,
         ss_matrices_sim['C_comp'],
         ss_matrices_sim['H_comp'],
         ss_matrices_sim['init_x_sim'],
         ss_matrices_sim['init_P_sim']
     )
 
-    # Filter the simulated data y_star_dense_sim (assumed dense)
+    # Filter and smooth the simulated data
     filter_results_star_dense = temp_dk_smoother._filter_internal(y_star_dense_sim)
-
-    # Smooth the filter results from simulated data
     x_smooth_star_dense, _ = temp_dk_smoother._rts_smoother_backend(filter_results_star_dense)
 
-    # 3. Apply the Durbin-Koopman formula
-    # x_draw = x_smooth_original + (x_star - x_smooth_star)
+    # 4. Apply the Durbin-Koopman formula
     x_draw = x_smooth_original_dense + (x_star_path - x_smooth_star_dense)
 
     # Ensure final draw is finite
     x_draw = jnp.where(jnp.isfinite(x_draw), x_draw, jnp.zeros_like(x_draw))
 
-    return x_draw # This is the simulated state path (k_states x T_obs)
+    return x_draw
 
-# Update the JIT compilation for run_single_simulation_path_for_dk
-# It needs static_config_data as a static argument
-# It also needs x_smooth_original_dense and smoother_params_single_draw
-# to be passed dynamically *into* the JIT function.
 
-# Let's define a wrapper for JIT compilation that takes dynamic args
+# Updated JITted wrapper function
 #@jax.jit(static_argnames=['static_config_data'])
 def jit_run_single_simulation_path_for_dk_wrapper(
     smoother_params_single_draw: Dict[str, jax.Array],
@@ -444,8 +468,7 @@ def jit_run_single_simulation_path_for_dk_wrapper(
     static_config_data: Dict[str, Any]
 ):
     """
-    Wrapper to JIT compile run_single_simulation_path_for_dk.
-    Constructs SS matrices inside the JIT function using the dynamic params.
+    FIXED: JIT wrapper that properly constructs SS matrices inside JIT scope.
     """
     # Construct state-space matrices for this draw inside the JIT scope
     ss_matrices_sim = construct_ss_matrices_from_smoother_params(
@@ -458,9 +481,13 @@ def jit_run_single_simulation_path_for_dk_wrapper(
         original_ys_dense,
         x_smooth_original_dense,
         key,
-        static_config_data # Pass config for dimensions etc.
+        static_config_data,
+        smoother_params_single_draw  # FIXED: Pass the missing parameter
     )
     return simulated_states_path
 
-
+# Update the JIT compilation for run_single_simulation_path_for_dk
+# It needs static_config_data as a static argument
+# It also needs x_smooth_original_dense and smoother_params_single_draw
+# to be passed dynamically *into* the JIT function.
 # The main function in estimate_bvar_with_dls_priors.py will call this wrapper.
