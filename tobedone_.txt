@@ -1,0 +1,2310 @@
+Okay, let's wrap the existing BVAR estimation and smoothing logic into a more structured set of functions. We'll create a few new files to organize these tools:
+
+1.  `bvar_tools.py`: This will contain the main user-facing functions for estimation, smoothing with a single parameter set, plotting, and potentially saving results.
+2.  `bvar_simulation.py`: This will contain the logic for simulating data based on the model structure.
+3.  `example_script.py`: This will demonstrate how to use the functions in `bvar_tools.py` and `bvar_simulation.py`.
+
+We will also slightly modify `var_ss_model.py` and `run_single_draw.py` to consistently use the comprehensive static config dictionary returned by `load_config_and_prepare_jax_static_args` (which is already in `var_ss_model.py`).
+
+**File 1: `utils/Kalman_filter_jax.py`** (Already provided, no changes needed, just ensure it's accessible in the `utils` directory)
+```python
+# (Content of input_file_0.py)
+```
+
+**File 2: `utils/stationary_prior_jax_simplified.py`** (Already provided, no changes needed, just ensure it's accessible in the `utils` directory)
+```python
+# (Content of input_file_1.py)
+```
+
+**File 3: `utils/hybrid_dk_smoother.py`** (Already provided, no changes needed, just ensure it's accessible in the `utils` directory)
+```python
+# (Content of input_file_2.py)
+```
+
+**File 4: `var_ss_model.py`** (Modified to ensure it uses the `config_data` dictionary consistently and to move helper functions not strictly needed *inside* the model function itself to the top level or a separate utility.)
+```python
+# --- var_ss_model.py (Modified for consistent config_data usage) ---
+# NumPyro model for the BVAR with stationary prior and trends.
+
+import jax
+import jax.numpy as jnp
+import jax.random as random
+import jax.scipy.linalg as jsl
+import numpyro
+from numpyro import distributions as dist
+from numpyro.distributions import constraints
+from typing import Dict, Tuple, List, Any, Sequence, Optional
+import yaml # Added for load_config_and_prepare_jax_static_args
+
+# Assuming utils directory is in the Python path and contains the necessary files
+# These are needed by build_state_space_matrices_jit
+from utils.stationary_prior_jax_simplified import make_stationary_var_transformation_jax, create_companion_matrix_jax 
+from utils.Kalman_filter_jax import KalmanFilter # Use the standard KF for likelihood
+
+# Configure JAX for float64
+jax.config.update("jax_enable_x64", True)
+_DEFAULT_DTYPE = jnp.float64
+
+# Add a small jitter for numerical stability
+_MODEL_JITTER = 1e-8
+
+
+# Helper function to get static off-diagonal indices (Kept here)
+def _get_off_diagonal_indices(n: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Generates row and column indices for off-diagonal elements of an n x n matrix.
+    These indices are static once n is known.
+    """
+    if n <= 1: # No off-diagonal elements for 0x0 or 1x1 matrices
+        return jnp.empty((0,), dtype=jnp.int32), jnp.empty((0,), dtype=jnp.int32)
+
+    rows, cols = jnp.meshgrid(jnp.arange(n), jnp.arange(n))
+    mask = jnp.eye(n, dtype=bool)
+    off_diag_rows = rows[~mask]
+    off_diag_cols = cols[~mask]
+    return off_diag_rows.astype(jnp.int32), off_diag_cols.astype(jnp.int32) # Ensure int32 dtype
+
+
+# Helper function to parse model equations (JAX compatible version of _parse_equation) (Kept here)
+def _parse_equation_jax(
+    equation: str,
+    trend_names: List[str],
+    stationary_var_names: List[str],
+    measurement_param_names: List[str],
+    dtype=_DEFAULT_DTYPE
+) -> List[Tuple[Optional[str], str, float]]:
+    """
+    Parse a measurement equation string into components with signs.
+    Returns a list of tuples (param_name, state_name, sign).
+    param_name is None for direct state terms.
+    This function is executed *outside* the JAX graph (e.g., during model setup)
+    as it relies on string parsing. The result is used to build the C matrix inside the model.
+    """
+    # Pre-process the equation string
+    equation = equation.replace(' - ', ' + -')
+    if equation.startswith('-'):
+        equation = '-' + equation[1:].strip()
+
+    # Split terms by '+'
+    terms_str = [t.strip() for t in equation.split('+')]
+
+    parsed_terms = []
+    for term_str in terms_str:
+        sign = 1.0
+        if term_str.startswith('-'):
+            sign = -1.0
+            term_str = term_str[1:].strip()
+
+        if '*' in term_str:
+            parts = [p.strip() for p in term_str.split('*')]
+            if len(parts) != 2:
+                raise ValueError(f"Invalid term '{term_str}': Must have exactly one '*' operator")
+
+            param, state = None, None
+            if parts[0] in measurement_param_names:
+                param, state = parts[0], parts[1]
+            elif parts[1] in measurement_param_names:
+                param, state = parts[1], parts[0]
+            else:
+                 raise ValueError(
+                        f"Term '{term_str}' contains no valid parameter. "
+                        f"Valid parameters are: {measurement_param_names}"
+                    )
+
+            if (state not in trend_names and
+                state not in stationary_var_names):
+                 raise ValueError(
+                        f"Invalid state variable '{state}'. " 
+                    )
+
+            parsed_terms.append((param, state, sign))
+        else:
+            if (term_str not in trend_names and
+                term_str not in stationary_var_names):
+                 raise ValueError(
+                        f"Invalid state variable '{term_str}'. " 
+                    )
+            parsed_terms.append((None, term_str, sign))
+
+    return parsed_terms
+
+
+# Helper function to parse config initial states for NumPyro (Kept here)
+def parse_initial_state_config(initial_conditions_config: Dict[str, Any]) -> Dict[str, Dict[str, jax.Array]]:
+    """
+    Parse initial state configuration (means and variances) from config.yaml.
+    Returns a dictionary of {state_name: {"mean": jax.Array, "var": jax.Array}}.
+    """
+    parsed_states = {}
+    raw_states_config = initial_conditions_config.get('states', {})
+
+    for state_name, state_config in raw_states_config.items():
+        parsed = {}
+        if isinstance(state_config, (int, float)):
+            parsed = {"mean": float(state_config), "var": 1.0}
+        elif isinstance(state_config, dict) and "mean" in state_config:
+            parsed = state_config
+        elif isinstance(state_config, str):
+            parts = state_config.split()
+            temp_result = {}
+            for i in range(0, len(parts), 2):
+                if i + 1 < len(parts):
+                    key = parts[i].strip().rstrip(':')
+                    value = float(parts[i + 1])
+                    temp_result[key] = value
+            if "mean" in temp_result:
+                if "var" not in temp_result:
+                    temp_result["var"] = 1.0
+                parsed = temp_result
+
+        if "mean" not in parsed:
+            raise ValueError(f"Could not parse mean for initial state '{state_name}'.")
+        if "var" not in parsed:
+             raise ValueError(f"Could not parse variance for initial state '{state_name}'.")
+
+        # Ensure var is non-negative, clip at a small value, return as JAX array
+        var_val = jnp.maximum(jnp.array(parsed["var"], dtype=_DEFAULT_DTYPE), 1e-12) 
+        parsed_states[state_name] = {"mean": jnp.array(parsed["mean"], dtype=_DEFAULT_DTYPE), "var": var_val}
+
+    return parsed_states
+
+# Helper to load and parse config and prepare *all* static args for JAX functions (Kept here)
+def load_config_and_prepare_jax_static_args(config_path: str) -> Dict[str, Any]:
+    """
+    Loads YAML configuration, parses it, and prepares a dictionary of static
+    arguments suitable for JAX-based models and functions, particularly for the NumPyro BVAR.
+    This dict contains both raw config sections and pre-parsed JAX structures.
+    """
+    # Step 1 & 2: Load YAML
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    # Step 3: Parse variables
+    variables_config = config.get('variables', {})
+    observable_names = tuple(variables_config.get('observable', [])) # Corrected key 'observable'
+    trend_var_names = tuple(variables_config.get('trends', []))
+    stationary_var_names = tuple(variables_config.get('stationary', []))
+
+    # Step 4: Parse var_order
+    var_order = int(config.get('var_order', 1))
+
+    # Step 5: Calculate dimensions
+    k_endog = len(observable_names)
+    k_trends = len(trend_var_names)
+    k_stationary = len(stationary_var_names)
+    p = var_order
+    k_states = k_trends + k_stationary * p
+
+    # Step 6: Parse initial_conditions
+    raw_initial_conds = config.get('initial_conditions', {})
+    parsed_initial_conds_from_yaml = parse_initial_state_config(raw_initial_conds)
+
+    # Prepare flat arrays for init_x and init_P diagonal based on the full state vector order
+    full_state_names_list = list(trend_var_names)
+    for i in range(p):
+        for stat_var in stationary_var_names:
+            if i == 0: # Current cycle is the first block after trends
+                full_state_names_list.append(stat_var)
+            else: # Lagged cycles follow in blocks
+                full_state_names_list.append(f"{stat_var}_t_minus_{i}")
+    full_state_names_tuple = tuple(full_state_names_list)
+
+    init_x_means_flat_list = []
+    init_P_diag_flat_list = []
+
+    for state_name in full_state_names_tuple:
+        base_name_for_lag = state_name.split("_t_minus_")[0] if "_t_minus_" in state_name else state_name
+
+        if state_name in parsed_initial_conds_from_yaml:
+            init_x_means_flat_list.append(parsed_initial_conds_from_yaml[state_name]['mean'])
+            init_P_diag_flat_list.append(parsed_initial_conds_from_yaml[state_name]['var'])
+        elif base_name_for_lag in parsed_initial_conds_from_yaml and base_name_for_lag != state_name : # Lagged state, use base name's spec
+            init_x_means_flat_list.append(parsed_initial_conds_from_yaml[base_name_for_lag]['mean']) 
+            init_P_diag_flat_list.append(parsed_initial_conds_from_yaml[base_name_for_lag]['var'])  
+        else: # Default if not specified at all
+            init_x_means_flat_list.append(jnp.array(0.0, dtype=_DEFAULT_DTYPE))
+            init_P_diag_flat_list.append(jnp.array(1.0, dtype=_DEFAULT_DTYPE))
+
+    init_x_means_flat = jnp.stack(init_x_means_flat_list) if init_x_means_flat_list else jnp.empty((0,), dtype=_DEFAULT_DTYPE)
+    init_P_diag_flat = jnp.stack(init_P_diag_flat_list) if init_P_diag_flat_list else jnp.empty((0,), dtype=_DEFAULT_DTYPE)
+
+
+    # Step 7: Parse model_equations
+    model_equations_config_raw_dict = config.get('model_equations', {}) # Keep as dict
+
+    # Need list of measurement parameter names first
+    measurement_params_config_raw_list = config.get('parameters', []) # List of dicts
+    measurement_param_names_list = [p['name'] for p in measurement_params_config_raw_list if 'name' in p]
+    measurement_param_names_tuple = tuple(measurement_param_names_list)
+
+    # Map state names relevant for C matrix (trends + current stationary) to index in the C matrix column
+    c_matrix_state_names = list(trend_var_names) + list(stationary_var_names)
+    state_to_c_idx_map = {name: i for i, name in enumerate(c_matrix_state_names)}
+    # Map parameter names to index in the measurement_params_array
+    param_to_idx_map = {name: i for i, name in enumerate(measurement_param_names_tuple)}
+
+    # Create the detailed parsed structure for C matrix build (term_type, state_index_in_C, param_index_if_any, sign)
+    parsed_model_eqs_jax_detailed = []
+    for obs_idx, obs_name in enumerate(observable_names):
+        eq_str = model_equations_config_raw_dict.get(obs_name)
+        if eq_str is None:
+            raise ValueError(f"Equation for observable '{obs_name}' not found in model_equations.")
+
+        # Use the JAX parsing helper that handles string parsing
+        raw_parsed_terms = _parse_equation_jax(
+            eq_str,
+            list(trend_var_names),
+            list(stationary_var_names),
+            list(measurement_param_names_tuple)
+        )
+        processed_terms_for_obs = []
+        for param_name, state_name_in_eq, sign in raw_parsed_terms:
+            term_type = 0 if param_name is None else 1
+            state_index_in_C = state_to_c_idx_map[state_name_in_eq] # Map name to index in C's columns
+            param_index_if_any = param_to_idx_map.get(param_name, -1) # Map param name to index in parameter array, use -1 if not found
+            processed_terms_for_obs.append(
+                (term_type, state_index_in_C, param_index_if_any, float(sign)) # Ensure sign is float
+            )
+        parsed_model_eqs_jax_detailed.append((obs_idx, tuple(processed_terms_for_obs))) # Tuple the inner list
+
+    parsed_model_eqs_jax_detailed_tuple = tuple(parsed_model_eqs_jax_detailed) # Tuple the outer list
+
+
+    # Step 8: Parse trend_shocks (names)
+    trend_shocks_section_raw_dict = config.get('trend_shocks', {})
+    trend_shocks_config_raw_dict_nested = trend_shocks_section_raw_dict.get('trend_shocks', {})
+    trend_names_with_shocks_list = []
+    for trend_name in trend_var_names:
+        if trend_name in trend_shocks_config_raw_dict_nested:
+            if 'distribution' in trend_shocks_config_raw_dict_nested[trend_name]:
+                 trend_names_with_shocks_list.append(trend_name)
+    trend_names_with_shocks_tuple = tuple(trend_names_with_shocks_list)
+    n_trend_shocks = len(trend_names_with_shocks_tuple)
+
+
+    # Step 9: Calculate static_off_diag_indices for A matrix
+    static_off_diag_rows, static_off_diag_cols = _get_off_diagonal_indices(k_stationary)
+    num_off_diag = k_stationary * (k_stationary - 1) if k_stationary > 1 else 0
+    static_off_diag_indices = (static_off_diag_rows, static_off_diag_cols)
+
+
+    # Step 10: Parse stationary_prior hyperparameters and shock specs
+    stationary_prior_config_raw_dict = config.get('stationary_prior', {})
+    hyperparams_raw = stationary_prior_config_raw_dict.get('hyperparameters', {'es': [0.0, 0.0], 'fs': [1.0, 0.5]})
+    es_jax = jnp.array(hyperparams_raw.get('es', [0.0, 0.0]), dtype=_DEFAULT_DTYPE)
+    fs_jax = jnp.array(hyperparams_raw.get('fs', [1.0, 0.5]), dtype=_DEFAULT_DTYPE)
+    eta_float = float(stationary_prior_config_raw_dict.get('covariance_prior', {}).get('eta', 1.0))
+
+    stationary_shocks_raw_dict = stationary_prior_config_raw_dict.get('stationary_shocks', {})
+    _stationary_shocks_parsed_list = []
+    for stat_var_name in stationary_var_names:
+        spec = stationary_shocks_raw_dict.get(stat_var_name)
+        if not spec or 'distribution' not in spec:
+            raise ValueError(f"Missing shock specification for stationary variable '{stat_var_name}' in config.")
+        dist_name = spec['distribution'].lower()
+        params = spec.get('parameters', {})
+        if dist_name == 'inverse_gamma':
+            alpha = float(params.get('alpha', 2.0))
+            beta = float(params.get('beta', 0.5))
+            _stationary_shocks_parsed_list.append({'name': stat_var_name, 'dist_idx': 0, 'alpha': alpha, 'beta': beta})
+        else:
+            raise NotImplementedError(f"Stationary shock distribution '{dist_name}' not supported.")
+    stationary_shocks_parsed_jax = tuple(_stationary_shocks_parsed_list)
+
+
+    # Step 11: Parse trend_shocks (specs)
+    _trend_shocks_parsed_list = []
+    for trend_name_with_shock in trend_names_with_shocks_tuple:
+        spec = trend_shocks_config_raw_dict_nested.get(trend_name_with_shock)
+        dist_name = spec['distribution'].lower()
+        params = spec.get('parameters', {})
+        if dist_name == 'inverse_gamma':
+            alpha = float(params.get('alpha', 2.0))
+            beta = float(params.get('beta', 0.5))
+            _trend_shocks_parsed_list.append({'name': trend_name_with_shock, 'dist_idx': 0, 'alpha': alpha, 'beta': beta})
+        else:
+            raise NotImplementedError(f"Trend shock distribution '{dist_name}' not supported.")
+    trend_shocks_parsed_jax = tuple(_trend_shocks_parsed_list)
+
+
+    # Step 12: Parse parameters (measurement parameters specs)
+    _measurement_params_config_parsed_list = []
+    for param_spec_raw in measurement_params_config_raw_list: # This is already a list of dicts
+        name = param_spec_raw['name']
+        prior_info = param_spec_raw.get('prior', {})
+        dist_name = prior_info.get('distribution', '').lower()
+        params = prior_info.get('parameters', {})
+
+        parsed_item = {'name': name}
+        if dist_name == 'normal':
+            parsed_item['dist_idx'] = 0
+            parsed_item['mu'] = float(params.get('mu', 0.0))
+            parsed_item['sigma'] = float(params.get('sigma', 1.0))
+        elif dist_name == 'half_normal':
+            parsed_item['dist_idx'] = 1
+            parsed_item['sigma'] = float(params.get('sigma', 1.0))
+        else:
+            raise NotImplementedError(f"Measurement parameter prior distribution '{dist_name}' for '{name}' not supported.")
+        _measurement_params_config_parsed_list.append(parsed_item)
+    measurement_params_config_parsed_jax = tuple(_measurement_params_config_parsed_list)
+
+    # Step 13: Return dictionary containing *all* static JAX/config data
+    # This dictionary will be passed as `config_data` to the NumPyro model and other functions
+    return {
+        # Dimensions and Basic Names
+        "k_endog": k_endog,
+        "k_trends": k_trends,
+        "k_stationary": k_stationary,
+        "var_order": p,
+        "k_states": k_states,
+        "observable_names": observable_names,
+        "trend_var_names": trend_var_names,
+        "stationary_var_names": stationary_var_names,
+        "full_state_names_tuple": full_state_names_tuple,
+
+        # Initial Conditions (Parsed JAX Arrays)
+        "init_x_means_flat": init_x_means_flat,
+        "init_P_diag_flat": init_P_diag_flat,
+        "initial_conditions_parsed": parsed_initial_conds_from_yaml, # Original parsed dict
+
+        # State Space Structure (Parsed JAX Structures)
+        "static_off_diag_indices": static_off_diag_indices, # Tuple (rows, cols)
+        "num_off_diag": num_off_diag,
+        "parsed_model_eqs_jax_detailed": parsed_model_eqs_jax_detailed_tuple, # (obs_idx, (term_type, state_idx_C, param_idx, sign))
+        "measurement_param_names_tuple": measurement_param_names_tuple,
+        "n_trend_shocks": n_trend_shocks,
+        "trend_names_with_shocks": trend_names_with_shocks_tuple, # Tuple of names
+
+        # Prior Hyperparameters (Parsed JAX Arrays/Floats)
+        "stationary_hyperparams_es_fs_jax": (es_jax, fs_jax),
+        "stationary_cov_prior_eta": eta_float,
+        "stationary_shocks_parsed_spec": stationary_shocks_parsed_jax, # (name, dist_idx, params...)
+        "trend_shocks_parsed_spec": trend_shocks_parsed_jax,       # (name, dist_idx, params...)
+        "measurement_params_parsed_spec": measurement_params_config_parsed_jax, # (name, dist_idx, params...)
+
+        # Raw Config Sections (for reference or redundant access within model)
+        "raw_config_initial_conds": raw_initial_conds,
+        "raw_config_stationary_prior": stationary_prior_config_raw_dict,
+        "raw_config_trend_shocks": trend_shocks_section_raw_dict,
+        "raw_config_measurement_params": measurement_params_config_raw_list,
+        "raw_config_model_eqs_str_dict": model_equations_config_raw_dict,
+    }
+
+
+# JIT compiled function to build state space matrices from sampled parameters and static config (Kept here)
+# Needs the comprehensive config_data dictionary as a static argument
+@jax.jit(static_argnames=["static_config_data"])
+def build_state_space_matrices_jit(
+    params_dict: Dict[str, jax.Array], 
+    static_config_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Constructs state-space matrices and related terms from sampled parameters
+    and static configuration data. JIT-compiled for performance.
+
+    Args:
+        params_dict: Dictionary of sampled JAX arrays for parameters.
+        static_config_data: Dictionary from load_config_and_prepare_jax_static_args.
+
+    Returns:
+        A dictionary containing the constructed state-space matrices and terms.
+    """
+    # --- Extract Static Configuration ---
+    k_endog = static_config_data['k_endog']
+    k_trends = static_config_data['k_trends']
+    k_stationary = static_config_data['k_stationary']
+    p = static_config_data['var_order']
+    k_states = static_config_data['k_states']
+    
+    static_off_diag_rows, static_off_diag_cols = static_config_data['static_off_diag_indices']
+    num_off_diag = static_config_data['num_off_diag'] 
+    
+    n_trend_shocks = static_config_data['n_trend_shocks']
+    trend_names_with_shocks_tuple = static_config_data['trend_names_with_shocks'] 
+    
+    trend_var_names_tuple = static_config_data['trend_var_names']
+    stationary_var_names_tuple = static_config_data['stationary_var_names']
+    
+    parsed_model_eqs_jax_detailed = static_config_data['parsed_model_eqs_jax_detailed']
+    measurement_param_names_tuple = static_config_data['measurement_param_names_tuple']
+
+    init_x_means_flat = static_config_data['init_x_means_flat']
+    init_P_diag_flat = static_config_data['init_P_diag_flat']
+
+    # --- Extract Dynamic Parameters ---
+    A_diag = params_dict['A_diag'] 
+    A_offdiag_flat = params_dict.get('A_offdiag') 
+    
+    _stationary_variances_values = []
+    for name in stationary_var_names_tuple: # This tuple comes from static_config_data
+        _stationary_variances_values.append(params_dict[f'stationary_var_{name}'])
+    
+    stationary_variances_array = jnp.stack(_stationary_variances_values) if k_stationary > 0 else jnp.array([], dtype=_DEFAULT_DTYPE)
+
+    # stationary_chol is Cholesky of Correlation matrix
+    if k_stationary > 1:
+        stationary_chol = params_dict['stationary_chol'] 
+    elif k_stationary == 1: 
+        stationary_chol = jnp.eye(1, dtype=_DEFAULT_DTYPE) # Correlation matrix is 1, Cholesky is 1
+    else: # k_stationary == 0
+        stationary_chol = jnp.empty((0,0), dtype=_DEFAULT_DTYPE)
+
+    _trend_variances_values = []
+    for name in trend_names_with_shocks_tuple: # This tuple comes from static_config_data
+        _trend_variances_values.append(params_dict[f'trend_var_{name}'])
+    
+    trend_variances_array = jnp.stack(_trend_variances_values) if n_trend_shocks > 0 else jnp.array([], dtype=_DEFAULT_DTYPE)
+
+    _measurement_params_sampled_values = []
+    for name in measurement_param_names_tuple: # This tuple comes from static_config_data
+        _measurement_params_sampled_values.append(params_dict[name])
+    
+    if len(measurement_param_names_tuple) > 0:
+        measurement_params_sampled_array = jnp.array(_measurement_params_sampled_values, dtype=_DEFAULT_DTYPE)
+    else:
+        measurement_params_sampled_array = jnp.array([], dtype=_DEFAULT_DTYPE)
+
+
+    # --- Reconstruct A_draws ---
+    A_draws = jnp.zeros((p, k_stationary, k_stationary), dtype=_DEFAULT_DTYPE)
+    if k_stationary > 0:
+        A_draws = A_draws.at[:, jnp.arange(k_stationary), jnp.arange(k_stationary)].set(A_diag)
+        if num_off_diag > 0 and A_offdiag_flat is not None:
+            A_draws = A_draws.at[:, static_off_diag_rows, static_off_diag_cols].set(A_offdiag_flat)
+
+    # --- Construct Sigma_cycles ---
+    if k_stationary > 0:
+        stationary_D_sds = jnp.diag(jnp.sqrt(jnp.maximum(stationary_variances_array, _MODEL_JITTER)))
+        # Sigma_cycles = stationary_chol @ stationary_D_sds @ stationary_chol.T (as per prompt)
+        Sigma_cycles = stationary_chol @ stationary_D_sds @ stationary_chol.T
+        Sigma_cycles = (Sigma_cycles + Sigma_cycles.T) / 2.0 
+        Sigma_cycles = Sigma_cycles + _MODEL_JITTER * jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE)
+    else: 
+        Sigma_cycles = jnp.empty((0,0), dtype=_DEFAULT_DTYPE)
+
+    # --- Construct Sigma_trends ---
+    if n_trend_shocks > 0:
+        Sigma_trends = jnp.diag(jnp.maximum(trend_variances_array, _MODEL_JITTER)) 
+        Sigma_trends = (Sigma_trends + Sigma_trends.T) / 2.0 # Ensure symmetry (already diag, but good practice)
+    else: 
+        Sigma_trends = jnp.empty((0,0), dtype=_DEFAULT_DTYPE)
+
+    # --- Transform A to phi_list ---
+    phi_list: List[jax.Array] = [] # Ensure phi_list is always a list
+    if k_stationary > 0:
+        A_list_for_phi = [A_draws[i] for i in range(p)] 
+        phi_list_candidate, _ = make_stationary_var_transformation_jax(Sigma_cycles, A_list_for_phi, k_stationary, p)
+        phi_list = phi_list_candidate
+
+    # --- Construct T_comp ---
+    T_comp = jnp.zeros((k_states, k_states), dtype=_DEFAULT_DTYPE)
+    T_comp = T_comp.at[:k_trends, :k_trends].set(jnp.eye(k_trends, dtype=_DEFAULT_DTYPE))
+    if k_stationary > 0:
+        companion_matrix = create_companion_matrix_jax(phi_list, p, k_stationary)
+        T_comp = T_comp.at[k_trends:, k_trends:].set(companion_matrix)
+
+    # --- Construct R_comp ---
+    n_shocks_state = n_trend_shocks + k_stationary
+    R_comp = jnp.zeros((k_states, n_shocks_state), dtype=_DEFAULT_DTYPE)
+
+    # Trends with shocks: Identity mapping for trends that have shocks
+    trend_state_indices = {name: i for i, name in enumerate(trend_var_names_tuple)}
+    trend_shock_mapping_indices = {name: i for i, name in enumerate(trend_names_with_shocks_tuple)}
+    for trend_name_with_shock in trend_names_with_shocks_tuple:
+        trend_state_idx = trend_state_indices[trend_name_with_shock]
+        shock_idx = trend_shock_mapping_indices[trend_name_with_shock]
+        R_comp = R_comp.at[trend_state_idx, shock_idx].set(1.0)
+
+
+    # Stationary shocks: Identity mapping to the *current* stationary state block
+    if k_stationary > 0:
+        R_comp = R_comp.at[k_trends:k_trends+k_stationary, n_trend_shocks:].set(jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE))
+
+    # 4. Observation Matrix (C) - using the detailed parsed structure
+    C_comp = jnp.zeros((k_endog, k_states), dtype=_DEFAULT_DTYPE)
+    # State indices for C matrix (Trends + Current Stationary Block)
+    state_indices_for_C_map = {name: i for i, name in enumerate(trend_var_names_tuple)} # Trends 0 to k_trends-1
+    state_indices_for_C_map.update({name: k_trends + i for i, name in enumerate(stationary_var_names_tuple)}) # Current Stationary k_trends to k_trends+k_stationary-1
+
+    for obs_idx, terms_for_obs in parsed_model_eqs_jax_detailed:
+        for term_type, state_name_in_eq_str, param_idx_if_any, sign_val in terms_for_obs:
+            # Map state_name_in_eq_str (from parsed tuple) to its index in the *full* state vector
+            state_idx_full_state = state_indices_for_C_map[state_name_in_eq_str]
+
+            is_param_term_and_valid = (term_type == 1 and param_idx_if_any >= 0 and param_idx_if_any < measurement_params_sampled_array.shape[0] and measurement_params_sampled_array.size > 0)
+
+            current_term_value = jnp.array(0.0, dtype=_DEFAULT_DTYPE)
+            if term_type == 0: # Direct state term
+                current_term_value = sign_val * 1.0
+            elif is_param_term_and_valid: # Valid parameter term
+                current_term_value = sign_val * measurement_params_sampled_array[param_idx_if_any]
+
+            C_comp = C_comp.at[obs_idx, state_idx_full_state].add(current_term_value)
+
+
+    # --- Construct H_comp ---
+    H_comp = jnp.zeros((k_endog, k_endog), dtype=_DEFAULT_DTYPE)
+
+    # --- Construct init_x_comp ---
+    init_x_comp = init_x_means_flat
+
+    # --- Construct init_P_comp ---
+    init_P_comp = jnp.diag(init_P_diag_flat)
+    init_P_comp = (init_P_comp + init_P_comp.T) / 2.0 + _MODEL_JITTER * jnp.eye(k_states, dtype=_DEFAULT_DTYPE)
+
+    return {
+        "T_comp": T_comp, "R_comp": R_comp, "C_comp": C_comp, "H_comp": H_comp,
+        "init_x_comp": init_x_comp, "init_P_comp": init_P_comp,
+        "Sigma_cycles": Sigma_cycles, "Sigma_trends": Sigma_trends,
+        "phi_list": phi_list, "A_draws": A_draws
+    }
+
+
+# Main NumPyro Model
+# Takes comprehensive config_data dictionary as a static argument
+def numpyro_bvar_stationary_model(
+    y: jax.Array, 
+    config_data: Dict[str, Any], 
+    static_valid_obs_idx: jax.Array, # These are derived from y but static for the model run
+    static_n_obs_actual: int
+):
+    """
+    NumPyro model for BVAR with trends using stationary prior.
+    State-space matrix construction is delegated to build_state_space_matrices_jit.
+    """
+    # --- Dimensions and Names (sourced from config_data) ---
+    k_endog = config_data['k_endog']
+    k_trends = config_data['k_trends']
+    k_stationary = config_data['k_stationary']
+    p = config_data['var_order']
+    k_states = config_data['k_states']
+    
+    num_off_diag = config_data['num_off_diag']
+    n_trend_shocks = config_data['n_trend_shocks']
+    
+    current_stationary_var_names = config_data['stationary_var_names'] # Tuple of names
+    trend_names_with_shocks_tuple = config_data['trend_names_with_shocks'] # Tuple of names
+    measurement_param_names_tuple = config_data['measurement_param_names_tuple'] # Tuple of names
+
+    # Prior specification details (sourced from parsed config_data)
+    es_param_val, fs_param_val = config_data['stationary_hyperparams_es_fs_jax']
+    eta_float = config_data['stationary_cov_prior_eta']
+    stationary_shocks_parsed_spec = config_data['stationary_shocks_parsed_spec']
+    trend_shocks_parsed_spec = config_data['trend_shocks_parsed_spec']
+    measurement_params_parsed_spec = config_data['measurement_params_parsed_spec']
+
+
+    # --- Parameter Sampling ---
+    params_for_jit = {} # Dictionary to hold all sampled parameters for the JIT function
+
+    # 1. Stationary VAR Coefficients (A_diag, A_offdiag)
+    params_for_jit['A_diag'] = numpyro.sample(
+        "A_diag",
+        dist.Normal(es_param_val[0], fs_param_val[0]).expand([p, k_stationary])
+    )
+    if num_off_diag > 0:
+        params_for_jit['A_offdiag'] = numpyro.sample(
+            "A_offdiag",
+            dist.Normal(es_param_val[1], fs_param_val[1]).expand([p, num_off_diag])
+        )
+
+    # 2. Stationary Cycle Shock Variances
+    _temp_stationary_variances_list = [] 
+    for shock_spec in stationary_shocks_parsed_spec: 
+        # We assume dist_idx 0 corresponds to InverseGamma based on load_config
+        if shock_spec['dist_idx'] == 0:
+            sampled_var = numpyro.sample(
+                f"stationary_var_{shock_spec['name']}",
+                dist.InverseGamma(shock_spec['alpha'], shock_spec['beta'])
+            )
+            params_for_jit[f'stationary_var_{shock_spec['name']}'] = sampled_var
+            _temp_stationary_variances_list.append(sampled_var)
+        # Add other distributions here if implemented in load_config_and_prepare_jax_static_args
+
+    # 3. Stationary Cycle Correlation Cholesky
+    if k_stationary > 1:
+        stationary_chol_sampled = numpyro.sample(
+            "stationary_chol",
+            dist.LKJCholesky(k_stationary, concentration=eta_float)
+        )
+        params_for_jit['stationary_chol'] = stationary_chol_sampled
+        
+    # 4. Trend Shock Variances
+    _temp_trend_variances_list = []
+    for shock_spec in trend_shocks_parsed_spec:
+         # We assume dist_idx 0 corresponds to InverseGamma
+         if shock_spec['dist_idx'] == 0:
+             sampled_var = numpyro.sample(
+                 f"trend_var_{shock_spec['name']}",
+                 dist.InverseGamma(shock_spec['alpha'], shock_spec['beta'])
+             )
+             params_for_jit[f'trend_var_{shock_spec['name']}'] = sampled_var
+             _temp_trend_variances_list.append(sampled_var)
+         # Add other distributions here if implemented
+
+
+    # 5. Measurement Parameters
+    for param_spec in measurement_params_parsed_spec:
+        param_name = param_spec['name']
+        if param_spec['dist_idx'] == 0: # Normal
+            params_for_jit[param_name] = numpyro.sample(param_name, dist.Normal(param_spec['mu'], param_spec['sigma']))
+        elif param_spec['dist_idx'] == 1: # HalfNormal
+            params_for_jit[param_name] = numpyro.sample(param_name, dist.HalfNormal(param_spec['sigma']))
+        # Add other distributions here
+
+
+    # --- Build State-Space Matrices using JITted function ---
+    # Pass the comprehensive static config_data dict as the static argument
+    ss_matrices = build_state_space_matrices_jit(params_for_jit, static_config_data=config_data)
+
+    # Unpack matrices from the returned dictionary
+    T_comp = ss_matrices['T_comp']
+    R_comp = ss_matrices['R_comp']
+    C_comp = ss_matrices['C_comp']
+    H_comp = ss_matrices['H_comp']
+    init_x_comp = ss_matrices['init_x_comp']
+    init_P_comp = ss_matrices['init_P_comp']
+    Sigma_cycles = ss_matrices['Sigma_cycles']
+    Sigma_trends = ss_matrices['Sigma_trends']
+    phi_list = ss_matrices['phi_list']
+    A_draws = ss_matrices['A_draws'] # Get A_draws from JIT output
+
+
+    # --- Initial State Distribution Validity Check (using matrices from JIT) ---
+    is_init_P_valid_computed = jnp.all(jnp.isfinite(init_P_comp)) & jnp.all(jnp.diag(init_P_comp) >= _MODEL_JITTER / 2.0)
+
+
+    # --- Prepare Static Args for Kalman Filter (using matrices from JIT) ---
+    # These are derived from C_comp, H_comp which came from the JITted function output
+    static_C_obs = C_comp[static_valid_obs_idx, :]
+    static_H_obs = H_comp[static_valid_obs_idx[:, None], static_valid_obs_idx]
+    static_I_obs = jnp.eye(static_n_obs_actual, dtype=_DEFAULT_DTYPE)
+
+
+    # --- Instantiate and Run Kalman Filter ---
+    # Inputs to KF need to have correct dtypes.
+    kf = KalmanFilter(T_comp, R_comp, C_comp, H_comp, init_x_comp, init_P_comp)
+
+    # Run the filter. Pass the observation data and the static args derived from data NaNs.
+    filter_results = kf.filter(
+        y, static_valid_obs_idx, static_n_obs_actual, static_C_obs, static_H_obs, static_I_obs
+    )
+
+    # --- Compute Total Log-Likelihood ---
+    total_log_likelihood = jnp.sum(filter_results['log_likelihood_contributions'])
+
+    # --- Add Likelihood and Penalties ---
+    penalty_init_P = jnp.where(is_init_P_valid_computed, 0.0, -1e10)
+
+    # Check for NaNs/Infs in key state space matrices produced by the JIT function
+    matrices_to_check = [T_comp, R_comp, C_comp, H_comp, init_x_comp[None, :], init_P_comp]
+    any_matrix_nan = jnp.array(False)
+    # This loop will be unrolled by JAX JIT if this function itself is JITted,
+    # but here it runs in Python mode over JAX arrays.
+    for mat in matrices_to_check:
+        if mat.size > 0: # Check only if matrix is not empty
+            any_matrix_nan |= jnp.any(jnp.isnan(mat))
+            any_matrix_nan |= jnp.any(jnp.isinf(mat)) # Also check for Infs
+            
+    penalty_matrix_nan = jnp.where(any_matrix_nan, -1e10, 0.0)
+
+    # Add log-likelihood and penalties
+    numpyro.factor("log_likelihood", total_log_likelihood + penalty_init_P + penalty_matrix_nan)
+
+    # --- Expose Transformed Parameters and State Space Matrices as Deterministics ---
+    # These are useful for analysis after sampling
+    numpyro.deterministic("phi_list", phi_list)
+    numpyro.deterministic("Sigma_cycles", Sigma_cycles)
+    numpyro.deterministic("Sigma_trends", Sigma_trends)
+    numpyro.deterministic("T_comp", T_comp)
+    numpyro.deterministic("R_comp", R_comp)
+    numpyro.deterministic("C_comp", C_comp)
+    numpyro.deterministic("H_comp", H_comp)
+    numpyro.deterministic("init_x_comp", init_x_comp)
+    numpyro.deterministic("init_P_comp", init_P_comp)
+    numpyro.deterministic("A_draws", A_draws) # Expose A_draws from JIT
+
+    numpyro.deterministic("k_states", k_states) # Expose state dimension
+
+
+    # Expose originally sampled variances and Cholesky factor for diagnostics
+    # Stationary variances
+    if k_stationary > 0:
+         for i, shock_spec in enumerate(stationary_shocks_parsed_spec):
+              numpyro.deterministic(f"stationary_var_{shock_spec['name']}_det", _temp_stationary_variances_list[i])
+
+         if k_stationary > 1:
+            numpyro.deterministic("stationary_chol_det", params_for_jit['stationary_chol'])
+         elif k_stationary == 1:
+            # Deterministic site for 1x1 correlation Cholesky (which is just [[1.0]])
+            numpyro.deterministic("stationary_chol_det", jnp.eye(1, dtype=_DEFAULT_DTYPE))
+
+
+    # Trend variances
+    if n_trend_shocks > 0:
+        for i, shock_spec in enumerate(trend_shocks_parsed_spec):
+             numpyro.deterministic(f"trend_var_{shock_spec['name']}_det", _temp_trend_variances_list[i])
+
+    # Measurement params
+    for param_spec in measurement_params_parsed_spec:
+         numpyro.deterministic(f"{param_spec['name']}_det", params_for_jit[param_spec['name']])
+
+```
+
+**File 5: `run_single_draw.py`** (Modified to accept the comprehensive `config_data` dictionary and pass it correctly.)
+```python
+# --- run_single_draw.py (Modified for consistent config_data usage) ---
+# Routine to run the simulation smoother for a single parameter vector
+# based on the BVAR with trends state space model.
+
+import jax
+import jax.numpy as jnp
+import jax.random as random
+import jax.scipy.linalg as jsl
+from typing import Dict, Tuple, Union, List, Any, Optional, Sequence
+
+# Configure JAX as requested
+jax.config.update("jax_enable_x64", True)
+# jax.config.update("jax_platform_name", "cpu") # Use CPU as requested (optional, but good for consistency)
+_DEFAULT_DTYPE = jnp.float64 # Define default dtype
+
+# Add a small jitter consistent with model/filter
+_DRAW_JITTER = 1e-8
+
+# Assuming utils directory is in the Python path
+# These are needed by build_state_space_matrices_jit (which is now imported from var_ss_model)
+# from utils.stationary_prior_jax_simplified import make_stationary_var_transformation_jax, create_companion_matrix_jax 
+
+# These are needed for the actual smoothing steps
+from utils.Kalman_filter_jax import KalmanFilter 
+from utils.hybrid_dk_smoother import HybridDKSimulationSmoother 
+
+# Import the JITted matrix building function and the config loading helper
+from var_ss_model import build_state_space_matrices_jit, load_config_and_prepare_jax_static_args # Import necessary functions
+
+
+# The single-parameter smoother function. It is JITted, and needs static arguments.
+# It now takes the comprehensive config_data dictionary as a static argument.
+def run_simulation_smoother_single_params(
+    params: Dict[str, jax.Array], # Dictionary of parameter values (DYNAMIC)
+    y: jax.Array, # Observed data (DYNAMIC)
+    key: jax.random.PRNGKey, # JAX random key (DYNAMIC)
+    static_config_data: Dict[str, Any], # Comprehensive static config (STATIC)
+    static_valid_obs_idx: jax.Array, # Indices of observed series (STATIC, derived from y, but static for JIT)
+    static_n_obs_actual: int,      # Number of actually observed series (STATIC, derived from y, but static for JIT)
+    num_draws: int = 1, # Number of simulation draws (STATIC)
+
+) -> Tuple[jax.Array, Union[jax.Array, Tuple[jax.Array, jax.Array, jax.Array]]]:
+    """
+    Runs the simulation smoother using a fixed parameter vector from the BVAR model.
+
+    Args:
+        params: Dictionary of parameter values (e.g., posterior mean/median).
+        y: Observed data (time_steps, static_k_endog). Can contain NaNs.
+        key: JAX random key for simulation draws.
+        static_config_data: Comprehensive dictionary of static configuration from
+                           load_config_and_prepare_jax_static_args.
+        static_valid_obs_idx: Indices of observed series columns in y.
+        static_n_obs_actual: Number of observed series columns.
+        num_draws: Number of simulation draws to perform.
+
+    Returns:
+        Tuple: (smoothed_states_original, simulation_results).
+        smoothed_states_original: Smoothed state means from filtering the original data (T, k_states).
+        simulation_results: Simulation smoother output (mean, median, all draws or just single draw).
+    """
+    # --- Reconstruct State-Space Matrices using JITted function ---
+    # build_state_space_matrices_jit takes params and the static_config_data dict
+    ss_matrices = build_state_space_matrices_jit(params, static_config_data)
+
+    # Unpack matrices from the returned dictionary
+    T_comp = ss_matrices['T_comp']
+    R_comp = ss_matrices['R_comp']
+    C_comp = ss_matrices['C_comp']
+    H_comp = ss_matrices['H_comp']
+    init_x_comp = ss_matrices['init_x_comp']
+    init_P_comp = ss_matrices['init_P_comp']
+
+    # --- Dimensions (sourced from static_config_data) ---
+    k_states = static_config_data['k_states']
+    k_endog = static_config_data['k_endog'] # Needed for C matrix construction checks
+
+    # --- Initial State Distribution Validity Check (using matrices from JIT) ---
+    # This check is based on the *constructed* init_P_comp
+    is_init_P_valid_computed = jnp.all(jnp.isfinite(init_P_comp)) & jnp.all(jnp.diag(init_P_comp) >= _DRAW_JITTER / 2.0)
+
+    # Check if any NaNs occurred *before* the Kalman filter (e.g., during matrix construction)
+    # Check key matrices for NaNs/Infs as a safeguard for the smoother.
+    matrices_to_check = [T_comp, R_comp, C_comp, H_comp, init_x_comp[None, :], init_P_comp] # Add dummy time dim for x
+    any_matrix_nan = jnp.array(False)
+    for mat in matrices_to_check:
+        if mat.size > 0: # Check only if matrix is not empty
+            any_matrix_nan |= jnp.any(jnp.isnan(mat))
+            any_matrix_nan |= jnp.any(jnp.isinf(mat)) # Also check for Infs
+
+    # If no observed series, cannot run filter/smoother for the initial smooth
+    T_steps = y.shape[0]
+    run_initial_smooth = is_init_P_valid_computed & (~any_matrix_nan) & (T_steps > 0) & (static_n_obs_actual > 0)
+
+
+    # Define default outputs for the case where initial smooth is skipped (NaNs)
+    default_smoothed_states = jnp.full((T_steps, k_states), jnp.nan, dtype=_DEFAULT_DTYPE)
+    default_sim_results: Union[jax.Array, Tuple[jax.Array, jax.Array, jax.Array]]
+    if num_draws == 1:
+         default_sim_results = jnp.full((T_steps, k_states), jnp.nan, dtype=_DEFAULT_DTYPE)
+    else:
+         default_sim_results = (
+             jnp.full((T_steps, k_states), jnp.nan, dtype=_DEFAULT_DTYPE), # Mean
+             jnp.full((T_steps, k_states), jnp.nan, dtype=_DEFAULT_DTYPE), # Median
+             jnp.full((num_draws, T_steps, k_states), jnp.nan, dtype=_DEFAULT_DTYPE) # All draws
+         )
+
+
+    def run_smoother_and_draws_actual(operand):
+        # Operand receives: (y_actual, kf_params_actual, key_actual, num_draws_actual)
+        # Static arguments from outer scope (static_config_data, static_valid_obs_idx,
+        # static_n_obs_actual, num_draws) are available here.
+        y_actual, kf_params_actual, key_actual, num_draws_actual = operand
+        T_comp_kf, R_comp_kf, C_comp_kf, H_comp_kf, init_x_comp_kf, init_P_comp_kf = kf_params_actual
+
+        # Derive sliced C, H, I for the KF filter step using static args from outer scope
+        static_C_obs_kf = C_comp_kf[static_valid_obs_idx, :] # Uses outer scope static arg
+        static_H_obs_kf = H_comp_kf[static_valid_obs_idx[:, None], static_valid_obs_idx] # Uses outer scope static arg
+        static_I_obs_kf = jnp.eye(static_n_obs_actual, dtype=_DEFAULT_DTYPE) # Uses outer scope static arg
+
+        # 1. Run filter on original (potentially NaN) data `y_actual`
+        kf_original = KalmanFilter(T_comp_kf, R_comp_kf, C_comp_kf, H_comp_kf, init_x_comp_kf, init_P_comp_kf)
+        filter_results_original = kf_original.filter(
+            y_actual, # Pass the observation data (DYNAMIC)
+            static_valid_obs_idx, # Static arg from outer scope
+            static_n_obs_actual, # Static arg from outer scope
+            static_C_obs_kf,
+            static_H_obs_kf,
+            static_I_obs_kf
+        )
+
+        # Check if filter produced valid results
+        filter_ok = jnp.all(jnp.isfinite(filter_results_original['x_filt'])) & \
+                    jnp.all(jnp.isfinite(filter_results_original['P_filt'])) & \
+                    jnp.all(jnp.isfinite(filter_results_original['log_likelihood_contributions']))
+
+        # 2. Run RTS smoother on original data filter results IF filter was OK
+        kf_smoother = KalmanFilter(T_comp_kf, R_comp_kf, C_comp_kf, H_comp_kf, init_x_comp_kf, init_P_comp_kf)
+        smoothed_states_original_means, smoothed_states_original_covs = jax.lax.cond(
+            filter_ok,
+            lambda res: kf_smoother.smooth(y_actual, filter_results=res), # Pass data and filter results to smooth
+            lambda res: (jnp.full((T_steps, k_states), jnp.nan, dtype=_DEFAULT_DTYPE), jnp.full((T_steps, k_states, k_states), jnp.nan, dtype=_DEFAULT_DTYPE)),
+            operand=filter_results_original
+        )
+
+
+        # 3. Run Simulation Smoother Draws IF initial smooth produced valid means
+        sim_smoother_draws_results: Union[jax.Array, Tuple[jax.Array, jax.Array, jax.Array]]
+        # Initialize with NaNs
+        if num_draws_actual == 1:
+            sim_smoother_draws_results = jnp.full((T_steps, k_states), jnp.nan, dtype=_DEFAULT_DTYPE)
+        else:
+            sim_smoother_draws_results = (
+                jnp.full((T_steps, k_states), jnp.nan, dtype=_DEFAULT_DTYPE), # Mean
+                jnp.full((T_steps, k_states), jnp.nan, dtype=_DEFAULT_DTYPE), # Median
+                jnp.full((num_draws_actual, T_steps, k_states), jnp.nan, dtype=_DEFAULT_DTYPE) # All draws
+            )
+
+        def run_draws_if_smooth_ok(smoothed_states_means_ok):
+            # Instantiate HybridDKSimulationSmoother. It needs the same state-space parameters.
+            # Note: DK Smoother assumes DENSE data for its internal operations.
+            dk_smoother = HybridDKSimulationSmoother(
+                T_comp_kf, R_comp_kf, C_comp_kf, H_comp_kf, init_x_comp_kf, init_P_comp_kf
+            )
+
+            # Impute NaNs in original_ys using predicted values from smoothed states
+            # y_actual might have NaNs. Create a dense version for the DK smoother.
+            # Predicted y = C @ x_smoothed_mean
+            y_predicted_from_smooth = smoothed_states_means_ok @ C_comp_kf.T 
+            # Fill NaNs in y_actual with these predicted values. Finite values are kept.
+            y_dense_for_draws = jnp.where(jnp.isfinite(y_actual), y_actual, y_predicted_from_smooth)
+
+            # Now call run_smoother_draws with the imputed dense data and the smoothed means
+            # run_smoother_draws in HybridDKSimulationSmoother handles its own keys splitting
+            key_draws = random.split(key_actual)[0] # Take first key from split for multiple draws
+
+            draws_results = dk_smoother.run_smoother_draws(
+                y_dense_for_draws, # Use imputed dense data (DYNAMIC)
+                key_draws, # DYNAMIC
+                num_draws_actual, # STATIC (passed from outer scope)
+                smoothed_states_means_ok # Use the correctly smoothed states from original data (DYNAMIC)
+            )
+            return draws_results
+
+        sim_smoother_draws_results = jax.lax.cond(
+            jnp.all(jnp.isfinite(smoothed_states_original_means)), # Only run draws if initial smooth produced finite means
+            run_draws_if_smooth_ok,
+            lambda smooth_means_failed: sim_smoother_draws_results, # Return default NaN results if initial smooth failed
+            operand=smoothed_states_original_means # Pass smoothed means to the conditional function
+        )
+
+
+        return smoothed_states_original_means, sim_smoother_draws_results
+
+
+    # Execute the main conditional logic
+    # Pass y, kf_params_tuple, key, num_draws as the dynamic operand.
+    # Static arguments (static_config_data, static_valid_obs_idx, static_n_obs_actual, num_draws)
+    # are available in the nested function's scope because they are parameters to the outer function.
+    kf_params_tuple = (T_comp, R_comp, C_comp, H_comp, init_x_comp, init_P_comp)
+    smoothed_states_original_means, sim_smoother_draws_results = jax.lax.cond(
+        run_initial_smooth, # Check if parameters are valid and data is present for initial smooth
+        run_smoother_and_draws_actual, # This branch is run if True
+        lambda op: (default_smoothed_states, default_sim_results), # This branch is run if False
+        # Operand for run_smoother_and_draws_actual:
+        operand=(y, kf_params_tuple, key, num_draws)
+    )
+
+
+    return smoothed_states_original_means, sim_smoother_draws_results
+
+
+# JIT compile the function with static arguments.
+# All arguments that are dimensions, indices, counts, or config structures are static.
+# Only 'params', 'y', 'key' are dynamic.
+# Note: static_config_data, static_valid_obs_idx, static_n_obs_actual, num_draws
+# are marked as static.
+run_simulation_smoother_single_params_jit = jax.jit(
+    run_simulation_smoother_single_params,
+    static_argnames=(
+        'static_config_data', # Comprehensive static config dictionary
+        'static_valid_obs_idx',
+        'static_n_obs_actual',
+        'num_draws', # num_draws is static
+    )
+)
+
+```
+
+**File 6: `bvar_simulation.py`** (New file for simulation logic)
+```python
+# --- bvar_simulation.py ---
+# Functions for simulating data from the BVAR with trends model structure.
+
+import jax
+import jax.numpy as jnp
+import jax.random as random
+from jax import lax
+from typing import Dict, Any, List, Tuple
+
+# Configure JAX for float64
+jax.config.update("jax_enable_x64", True)
+_DEFAULT_DTYPE = jnp.float64
+
+# Assuming utils directory is in the Python path
+# These are needed to build the state space matrices for simulation
+from utils.stationary_prior_jax_simplified import make_stationary_var_transformation_jax, create_companion_matrix_jax
+
+# Import the config loading and parsing helper
+from var_ss_model import load_config_and_prepare_jax_static_args
+
+
+def define_true_params(static_config_data: Dict[str, Any]) -> Dict[str, jax.Array]:
+    """
+    Defines a set of 'true' parameters for simulation, consistent with the model structure
+    and config dimensions. Calibrated roughly to the calibrated YAML example.
+
+    Args:
+        static_config_data: Comprehensive static config data from load_config_and_prepare_jax_static_args.
+
+    Returns:
+        Dictionary of 'true' parameter JAX arrays.
+    """
+    # Extract dimensions and names from static config
+    k_trends = static_config_data['k_trends']
+    k_stationary = static_config_data['k_stationary']
+    p = static_config_data['var_order']
+    trend_names_with_shocks_tuple = static_config_data['trend_names_with_shocks']
+    stationary_var_names_tuple = static_config_data['stationary_var_names']
+    measurement_param_names_tuple = static_config_data['measurement_param_names_tuple']
+
+
+    # --- True Parameters for Simulation ---
+
+    # True VAR(p) coefficient matrices (Phi_list: list of p matrices, k_stationary x k_stationary)
+    # Default to stable diagonal if not specified or dimensions don't match calibrated example
+    Phi_list_true = [jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE) * 0.5 for _ in range(p)]
+    # Example specific to k_stationary=2, p=1 (matching calibrated YAML)
+    if k_stationary == 2 and p >= 1:
+         Phi_list_true[0] = jnp.array([[0.7, 0.2], [0.1, 0.5]], dtype=_DEFAULT_DTYPE)
+         # If p > 1, others remain diagonal 0.5
+
+    # True stationary cycle shock covariance (Sigma_cycles: k_stationary x k_stationary)
+    # Default to identity with small variance if not specified or dimensions don't match
+    Sigma_cycles_true = jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE) * 0.1 # Default variance 0.1
+    # Example specific to k_stationary=2 (matching calibrated YAML)
+    if k_stationary == 2:
+        Sigma_cycles_true = jnp.array([[0.5, 0.1], [0.1, 0.3]], dtype=_DEFAULT_DTYPE)
+    Sigma_cycles_true = (Sigma_cycles_true + Sigma_cycles_true.T) / 2.0 # Ensure symmetry
+
+
+    # True trend shock variances (Sigma_trends_sim: diagonal n_trend_shocks x n_trend_shocks)
+    # Use dictionary to map trend names with shocks to variances.
+    # Default to a small variance (0.01) if not specified.
+    true_trend_vars_dict_sim = {
+        'trend_gdp': 0.05**2, # Variance matching calibrated YAML
+        'trend_inf': 0.0707**2, # Variance matching calibrated YAML
+        # Add other default variances here if other trend names are possible
+    }
+    true_trend_vars_with_shocks_sim = jnp.array([
+         true_trend_vars_dict_sim.get(name, 0.01) # Use variance from dict, default 0.01 otherwise
+         for name in trend_names_with_shocks_tuple # Use the tuple of names with shocks from config
+    ], dtype=_DEFAULT_DTYPE)
+    Sigma_trends_sim_true = jnp.diag(true_trend_vars_with_shocks_sim) # Shape (n_trend_shocks, n_trend_shocks)
+
+
+    # True measurement parameters (dict of scalars)
+    true_measurement_params = {
+        name: 1.0 # Default to 1.0 for all measurement parameters as per standard setup
+        for name in measurement_param_names_tuple # Use the tuple of names from config
+    }
+    # Add specific overrides if needed (e.g., matching calibrated YAML)
+    # true_measurement_params['my_param'] = 0.5
+
+
+    true_params_dict = {
+        'Phi_list': Phi_list_true,
+        'Sigma_cycles_sim': Sigma_cycles_true, # Use '_sim' suffix for clarity if needed elsewhere
+        'Sigma_trends_sim': Sigma_trends_sim_true,
+        'measurement_params': true_measurement_params,
+    }
+
+    return true_params_dict
+
+
+@jax.jit(static_argnames=["static_config_data", "T_sim"])
+def simulate_bvar_with_trends_jax(
+    key: jax.random.PRNGKey,
+    T_sim: int, # Number of time steps to simulate (STATIC)
+    static_config_data: Dict[str, Any], # Comprehensive static config (STATIC)
+    true_phi_list: List[jax.Array],
+    true_sigma_cycles: jax.Array,
+    true_sigma_trends_sim: jax.Array,
+    true_measurement_params_dict: Dict[str, jax.Array],
+) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """
+    Simulates data from the BVAR with trends state space model using true parameters.
+    Based on the state space representation structure.
+
+    Args:
+        key: JAX random key.
+        T_sim: Number of time steps to simulate.
+        static_config_data: Comprehensive static config data.
+        true_phi_list: True VAR coefficients.
+        true_sigma_cycles: True stationary cycle shock covariance.
+        true_sigma_trends_sim: True trend shock covariance (diagonal).
+        true_measurement_params_dict: Dictionary of true measurement parameter values.
+
+    Returns:
+        Tuple: (simulated_observations, true_full_states, true_cycles, true_trends).
+    """
+    # Extract dimensions and names from static config
+    k_endog = static_config_data['k_endog']
+    k_trends = static_config_data['k_trends']
+    k_stationary = static_config_data['k_stationary']
+    p = static_config_data['var_order']
+    k_states = static_config_data['k_states']
+    n_trend_shocks = static_config_data['n_trend_shocks']
+    trend_names_with_shocks_tuple = static_config_data['trend_names_with_shocks']
+    trend_var_names_tuple = static_config_data['trend_var_names']
+    stationary_var_names_tuple = static_config_data['stationary_var_names']
+    parsed_model_eqs_jax_detailed = static_config_data['parsed_model_eqs_jax_detailed']
+    measurement_param_names_tuple = static_config_data['measurement_param_names_tuple']
+    init_x_means_flat = static_config_data['init_x_means_flat']
+    init_P_diag_flat = static_config_data['init_P_diag_flat']
+
+
+    # --- Construct State-Space Matrices using TRUE parameters ---
+    # This logic mirrors build_state_space_matrices_jit but uses true parameters directly.
+
+    # 1. T matrix
+    T_comp = jnp.zeros((k_states, k_states), dtype=_DEFAULT_DTYPE)
+    T_comp = T_comp.at[:k_trends, :k_trends].set(jnp.eye(k_trends, dtype=_DEFAULT_DTYPE))
+    if k_stationary > 0:
+        # Use true_phi_list to build companion matrix
+        companion_matrix = create_companion_matrix_jax(true_phi_list, p, k_stationary)
+        T_comp = T_comp.at[k_trends:, k_trends:].set(companion_matrix)
+
+    # 2. R matrix (Shock Impact Matrix for State Space)
+    n_shocks_state = n_trend_shocks + k_stationary
+    R_comp = jnp.zeros((k_states, n_shocks_state), dtype=_DEFAULT_DTYPE)
+
+    # Trends with shocks: Identity mapping for trends that have shocks
+    trend_state_indices = {name: i for i, name in enumerate(trend_var_names_tuple)}
+    trend_shock_mapping_indices = {name: i for i, name in enumerate(trend_names_with_shocks_tuple)}
+    for shock_col_idx, shocked_trend_name in enumerate(trend_names_with_shocks_tuple):
+        state_row_idx = trend_state_indices[shocked_trend_name] # Get state index for this trend
+        R_comp = R_comp.at[state_row_idx, shock_col_idx].set(1.0)
+
+
+    # Stationary shocks: Identity mapping to the *current* stationary state block
+    if k_stationary > 0:
+        R_comp = R_comp.at[k_trends:k_trends+k_stationary, n_trend_shocks:].set(jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE))
+
+
+    # 3. State Shock Covariance (Q = R @ Sigma_shocks @ R.T)
+    # Sigma_shocks is block diagonal: [Sigma_trends_sim, 0; 0, Sigma_cycles]
+    Sigma_shocks_sim = jnp.zeros((n_shocks_state, n_shocks_state), dtype=_DEFAULT_DTYPE)
+    if n_trend_shocks > 0:
+        Sigma_shocks_sim = Sigma_shocks_sim.at[:n_trend_shocks, :n_trend_shocks].set(true_sigma_trends_sim)
+    if k_stationary > 0:
+        Sigma_shocks_sim = Sigma_shocks_sim.at[n_trend_shocks:, n_trend_shocks:].set(true_sigma_cycles)
+
+    state_cov_Q = R_comp @ Sigma_shocks_sim @ R_comp.T
+    state_cov_Q = (state_cov_Q + state_cov_Q.T) / 2.0 # Ensure symmetry
+
+
+    # 4. Observation Matrix (C)
+    # Need true measurement parameters as an array, aligned with measurement_param_names_tuple
+    true_measurement_params_array = jnp.array([
+        true_measurement_params_dict.get(name, 1.0) # Default to 1.0 if not provided
+        for name in measurement_param_names_tuple
+    ], dtype=_DEFAULT_DTYPE) if measurement_param_names_tuple else jnp.empty((0,), dtype=_DEFAULT_DTYPE)
+
+    C_comp = jnp.zeros((k_endog, k_states), dtype=_DEFAULT_DTYPE)
+    # State indices for C matrix (Trends + Current Stationary Block)
+    state_indices_for_C_map = {name: i for i, name in enumerate(trend_var_names_tuple)} # Trends 0 to k_trends-1
+    state_indices_for_C_map.update({name: k_trends + i for i, name in enumerate(stationary_var_names_tuple)}) # Current Stationary k_trends to k_trends+k_stationary-1
+
+    for obs_idx, terms_for_obs in parsed_model_eqs_jax_detailed:
+        for term_type, state_name_in_eq_str, param_idx_if_any, sign_val in terms_for_obs:
+            # Map state_name_in_eq_str (from parsed tuple) to its index in the *full* state vector
+            state_idx_full_state = state_indices_for_C_map[state_name_in_eq_str]
+
+            is_param_term_and_valid = (term_type == 1 and param_idx_if_any >= 0 and param_idx_if_any < true_measurement_params_array.shape[0] and true_measurement_params_array.size > 0)
+
+            current_term_value = jnp.array(0.0, dtype=_DEFAULT_DTYPE)
+            if term_type == 0: # Direct state term
+                current_term_value = sign_val * 1.0
+            elif is_param_term_and_valid: # Valid parameter term
+                current_term_value = sign_val * true_measurement_params_array[param_idx_if_any]
+
+            C_comp = C_comp.at[obs_idx, state_idx_full_state].add(current_term_value)
+
+
+    # 5. Observation Noise Covariance (H)
+    # H is a zero matrix based on PyMC code
+    H_comp = jnp.zeros((k_endog, k_endog), dtype=_DEFAULT_DTYPE)
+
+
+    # --- Initial State Distribution ---
+    # Mean (init_x): Fixed values from parsed initial_conditions (means)
+    init_x_comp = init_x_means_flat
+
+    # Covariance (init_P): Diagonal matrix from parsed initial_conditions variances, repeated for lags
+    init_P_comp = jnp.diag(init_P_diag_flat) # Shape (k_states, k_states)
+    init_P_comp = (init_P_comp + init_P_comp.T) / 2.0 # Ensure symmetry
+
+    # --- Simulate State Space ---
+    # This simulation uses the standard state-space form: x_t = T x_{t-1} + state_noise_t, y_t = C x_t + obs_noise_t
+    # state_noise_t ~ N(0, Q=R @ Sigma_shocks_sim @ R.T)
+    # obs_noise_t ~ N(0, H)
+
+    # We need sqrt(Q) and sqrt(H) for simulation
+    # Use Cholesky for stable square root assuming PSD matrices
+    L_Q = jnp.linalg.cholesky(state_cov_Q + 1e-12 * jnp.eye(k_states, dtype=_DEFAULT_DTYPE)) # Add jitter for stability
+    L_H = jnp.linalg.cholesky(H_comp + 1e-12 * jnp.eye(k_endog, dtype=_DEFAULT_DTYPE)) # Add jitter for stability
+
+
+    # Define the simulation step function for lax.scan
+    def sim_step(x_prev, noise_t):
+        # noise_t is a tuple (state_noise_std_normal_t, obs_noise_std_normal_t)
+        z_state_t, z_obs_t = noise_t
+
+        # State noise: state_noise_t = L_Q @ z_state_t
+        state_noise_t = L_Q @ z_state_t
+
+        # State equation: x_t = T x_{t-1} + state_noise_t
+        x_curr = T_comp @ x_prev + state_noise_t
+        x_curr = jnp.clip(x_curr, -1e10, 1e10) # Clip state values
+
+        # Observation noise: obs_noise_t = L_H @ z_obs_t
+        obs_noise_t = L_H @ z_obs_t
+
+        # Observation equation: y_t = C x_t + obs_noise_t
+        y_curr = C_comp @ x_curr + obs_noise_t if k_endog > 0 else jnp.empty((0,), dtype=_DEFAULT_DTYPE)
+
+        return x_curr, (x_curr, y_curr) # Return current state and observation as output
+
+
+    # Split keys for initial state and time-varying noise
+    key_init, key_state_noise, key_obs_noise = random.split(key, 3)
+
+    # Simulate initial state from N(init_x, init_P)
+    L0 = jnp.linalg.cholesky(init_P_comp + 1e-12 * jnp.eye(k_states, dtype=_DEFAULT_DTYPE)) # Add jitter
+    z0 = random.normal(key_init, (k_states,), dtype=_DEFAULT_DTYPE)
+    x0 = init_x_comp + L0 @ z0
+
+
+    # Generate standard normal noise for all time steps
+    state_noise_std_normal = random.normal(key_state_noise, (T_sim, k_states), dtype=_DEFAULT_DTYPE)
+    obs_noise_std_normal = random.normal(key_obs_noise, (T_sim, k_endog), dtype=_DEFAULT_DTYPE) if k_endog > 0 else jnp.empty((T_sim, 0), dtype=_DEFAULT_DTYPE)
+
+    # Run the simulation scan
+    # Scan takes (carry_init, xs) -> (carry_final, ys_out)
+    # Here: (x0, (state_noise_std_normal, obs_noise_std_normal)) -> (x_final, (states_sim_res, obs_sim_res))
+    _, (states_sim_res, obs_sim_res) = lax.scan(sim_step, x0, (state_noise_std_normal, obs_noise_std_normal))
+
+    # Ensure outputs are finite (optional, but safe)
+    states_sim_res = jnp.where(jnp.isfinite(states_sim_res), states_sim_res, jnp.zeros_like(states_sim_res))
+    obs_sim_res = jnp.where(jnp.isfinite(obs_sim_res), obs_sim_res, jnp.zeros_like(obs_sim_res))
+
+    # Extract true cycles and trends from the full state path
+    true_trends = states_sim_res[:, :k_trends]
+    # The *current* stationary cycles are the block after trends in the state vector, for p=1
+    # If p > 1, the state vector is [trends, cycle_t, cycle_{t-1}, ..., cycle_{t-p+1}]
+    # So, the current cycles are indices k_trends to k_trends + k_stationary - 1
+    true_cycles = states_sim_res[:, k_trends : k_trends + k_stationary]
+
+
+    return obs_sim_res, states_sim_res, true_cycles, true_trends
+
+
+```
+
+**File 7: `bvar_tools.py`** (New file for user-facing tools)
+```python
+# --- bvar_tools.py ---
+# User-facing functions for BVAR estimation, smoothing, plotting, and simulation.
+
+import jax
+import jax.numpy as jnp
+import jax.random as random
+import numpyro
+from numpyro.infer import MCMC, NUTS
+from numpyro.diagnostics import print_summary
+import arviz as az
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pandas as pd
+import time
+import os
+from typing import Dict, Any, List, Tuple, Optional, Union
+
+# Import necessary components from other local files
+from var_ss_model import numpyro_bvar_stationary_model, load_config_and_prepare_jax_static_args
+from run_single_draw import run_simulation_smoother_single_params_jit
+from bvar_simulation import simulate_bvar_with_trends_jax, define_true_params # Import simulation logic
+
+
+# Configure JAX as requested
+jax.config.update("jax_enable_x64", True)
+# jax.config.update("jax_platform_name", "cpu") # Optional: Use CPU
+
+_DEFAULT_DTYPE = jnp.float64 # Define dtype for consistency
+
+
+def estimate_bvar_mcmc(
+    data_df: pd.DataFrame,
+    config_path: str,
+    key: jax.random.PRNGKey,
+    num_warmup: int = 500,
+    num_samples: int = 1000,
+    num_chains: int = 2,
+    nuts_args: Optional[Dict[str, Any]] = None
+) -> Dict[str, jax.Array]:
+    """
+    Estimates the BVAR model using NumPyro MCMC.
+
+    Args:
+        data_df: Pandas DataFrame containing observed data. Must have a DatetimeIndex
+                 or PeriodIndex and columns matching observable names in config.
+        config_path: Path to the YAML configuration file.
+        key: JAX random key.
+        num_warmup: Number of warmup steps for MCMC.
+        num_samples: Number of sampling steps for MCMC per chain.
+        num_chains: Number of MCMC chains.
+        nuts_args: Optional dictionary of additional arguments for the NUTS kernel.
+
+    Returns:
+        Dictionary of posterior samples from the MCMC run.
+    """
+    print("--- Running BVAR MCMC Estimation ---")
+    start_time = time.time()
+
+    # 1. Load Configuration and Prepare Static Arguments
+    print("Loading configuration and preparing static JAX arguments...")
+    config_data = load_config_and_prepare_jax_static_args(config_path)
+    print("Configuration loaded.")
+
+    # 2. Prepare Data
+    print("Preparing data...")
+    observable_names = config_data['observable_names']
+    try:
+        # Select only the observable columns specified in the config
+        data_observed_pd = data_df[list(observable_names)] # Ensure columns are in config order for JAX array
+        data_observed_jax = jnp.asarray(data_observed_pd.values, dtype=_DEFAULT_DTYPE)
+        print(f"Data prepared. Shape: {data_observed_jax.shape}")
+        print(f"Data preview:\n{data_observed_pd.head()}")
+
+    except KeyError as e:
+        print(f"Error: Observable variable '{e}' not found in data DataFrame columns.")
+        raise # Re-raise the error
+    except Exception as e:
+        print(f"Error loading or processing data: {e}")
+        raise # Re-raise the error
+
+    # Identify static NaN handling parameters based on the loaded data
+    valid_obs_mask_cols = jnp.any(jnp.isfinite(data_observed_jax), axis=0)
+    static_valid_obs_idx = jnp.where(valid_obs_mask_cols)[0]
+    static_n_obs_actual = static_valid_obs_idx.shape[0]
+
+    if static_n_obs_actual == 0:
+        print("Warning: No observation series are observed after removing all-NaN columns.")
+        print("MCMC cannot be run.")
+        return {} # Return empty samples
+
+    # 3. Setup and Run MCMC
+    print(f"\nSetting up and running MCMC with {num_warmup} warmup steps and {num_samples} sampling steps per chain ({num_chains} chains)...")
+
+    # Use NumPyro's default init_to_sample
+    init_strategy = numpyro.infer.init_to_sample()
+
+    # Define NUTS kernel
+    default_nuts_args = {
+        'init_strategy': init_strategy,
+        'allow_partial_steps': False # Recommended for state space models
+        # Add other defaults here if needed, e.g., 'dense_mass': False
+    }
+    if nuts_args:
+        default_nuts_args.update(nuts_args)
+
+    kernel = NUTS(
+        model=numpyro_bvar_stationary_model,
+        **default_nuts_args
+    )
+
+    mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, num_chains=num_chains)
+
+    # Run MCMC, passing data and the prepared static config dictionary
+    # The model function expects y, config_data, static_valid_obs_idx, static_n_obs_actual
+    mcmc.run(
+        key,
+        y=data_observed_jax,
+        config_data=config_data, # Pass the comprehensive static config dict
+        static_valid_obs_idx=static_valid_obs_idx,
+        static_n_obs_actual=static_n_obs_actual,
+    )
+
+    end_time = time.time()
+    print(f"MCMC completed in {end_time - start_time:.2f} seconds.")
+
+    mcmc.print_summary()
+
+    # Get posterior samples
+    posterior_samples = mcmc.get_samples()
+
+    return posterior_samples
+
+
+def run_bvar_smoother(
+    params: Dict[str, jax.Array],
+    data_df: pd.DataFrame,
+    config_path: str,
+    key: jax.random.PRNGKey,
+    num_draws: int = 100,
+) -> Tuple[jax.Array, Union[jax.Array, Tuple[jax.Array, jax.Array, jax.Array]]]:
+    """
+    Runs the simulation smoother for a single fixed parameter vector (e.g., posterior mean/median).
+
+    Args:
+        params: Dictionary of parameter values (JAX arrays), expected to match
+                the names of *sampled* parameters in the NumPyro model.
+        data_df: Pandas DataFrame containing observed data. Must have a DatetimeIndex
+                 or PeriodIndex and columns matching observable names in config.
+        config_path: Path to the YAML configuration file.
+        key: JAX random key for simulation draws.
+        num_draws: Number of simulation draws for the smoother.
+
+    Returns:
+        Tuple: (smoothed_states_original, simulation_results).
+        smoothed_states_original: Smoothed state means from filtering the original data (T, k_states).
+        simulation_results: Simulation smoother output (mean, median, all draws or just single draw).
+    """
+    print(f"--- Running BVAR Simulation Smoother with {num_draws} draws ---")
+    start_time = time.time()
+
+    # 1. Load Configuration and Prepare Static Arguments
+    print("Loading configuration and preparing static JAX arguments...")
+    config_data = load_config_and_prepare_jax_static_args(config_path)
+    print("Configuration loaded.")
+
+    # 2. Prepare Data
+    print("Preparing data...")
+    observable_names = config_data['observable_names']
+    try:
+        data_observed_pd = data_df[list(observable_names)] # Ensure columns are in config order
+        data_observed_jax = jnp.asarray(data_observed_pd.values, dtype=_DEFAULT_DTYPE)
+        print(f"Data prepared. Shape: {data_observed_jax.shape}")
+    except KeyError as e:
+        print(f"Error: Observable variable '{e}' not found in data DataFrame columns.")
+        raise # Re-raise the error
+    except Exception as e:
+        print(f"Error loading or processing data: {e}")
+        raise # Re-raise the error
+
+    # Identify static NaN handling parameters based on the loaded data
+    valid_obs_mask_cols = jnp.any(jnp.isfinite(data_observed_jax), axis=0)
+    static_valid_obs_idx = jnp.where(valid_obs_mask_cols)[0]
+    static_n_obs_actual = static_valid_obs_idx.shape[0]
+
+    if static_n_obs_actual == 0:
+         print("Warning: No observation series are observed after removing all-NaN columns.")
+         print("Smoother cannot be run.")
+         T_steps = data_observed_jax.shape[0]
+         k_states = config_data['k_states']
+         # Return empty arrays with correct shapes
+         if num_draws == 1:
+             return jnp.empty((T_steps, k_states), dtype=_DEFAULT_DTYPE), jnp.empty((T_steps, k_states), dtype=_DEFAULT_DTYPE)
+         else:
+              return jnp.empty((T_steps, k_states), dtype=_DEFAULT_DTYPE), (
+                  jnp.empty((T_steps, k_states), dtype=_DEFAULT_DTYPE),
+                  jnp.empty((T_steps, k_states), dtype=_DEFAULT_DTYPE),
+                  jnp.empty((num_draws, T_steps, k_states), dtype=_DEFAULT_DTYPE)
+              )
+
+
+    # 3. Run Simulation Smoother (using the JITted single-draw routine)
+    print(f"Calling JITted smoother routine with {num_draws} draws...")
+
+    smoothed_states_original, simulation_results = run_simulation_smoother_single_params_jit(
+        params, # Dynamic parameter values
+        data_observed_jax, # Dynamic observation data
+        key, # Dynamic random key
+        static_config_data=config_data, # Static config dictionary
+        static_valid_obs_idx=static_valid_obs_idx, # Static indices from data
+        static_n_obs_actual=static_n_obs_actual, # Static count from data
+        num_draws=num_draws # Static number of draws
+    )
+
+    end_time = time.time()
+    print(f"Simulation smoother draws completed in {end_time - start_time:.2f} seconds.")
+
+    return smoothed_states_original, simulation_results
+
+
+def get_prior_mean_params(config_path: str) -> Dict[str, jax.Array]:
+    """
+    Gets the prior mean parameter values from the configuration.
+
+    Args:
+        config_path: Path to the YAML configuration file.
+
+    Returns:
+        Dictionary of parameter values corresponding to the prior means.
+    """
+    print("--- Getting Prior Mean Parameters ---")
+    config_data = load_config_and_prepare_jax_static_args(config_path)
+
+    params_mean = {}
+
+    # Stationary VAR Coefficients (A_diag, A_offdiag)
+    es_param_val, fs_param_val = config_data['stationary_hyperparams_es_fs_jax']
+    k_stationary = config_data['k_stationary']
+    p = config_data['var_order']
+    num_off_diag = config_data['num_off_diag']
+
+    params_mean['A_diag'] = jnp.full([p, k_stationary], es_param_val[0], dtype=_DEFAULT_DTYPE)
+    if num_off_diag > 0:
+        params_mean['A_offdiag'] = jnp.full([p, num_off_diag], es_param_val[1], dtype=_DEFAULT_DTYPE)
+
+    # Stationary Cycle Shock Variances (InverseGamma mean beta/(alpha-1))
+    stationary_shocks_parsed_spec = config_data['stationary_shocks_parsed_spec']
+    for shock_spec in stationary_shocks_parsed_spec:
+        if shock_spec['dist_idx'] == 0: # InverseGamma
+            mean_val = shock_spec['beta'] / (shock_spec['alpha'] - 1.0) if shock_spec['alpha'] > 1.0 else jnp.nan # Mean undefined if alpha <= 1
+            params_mean[f"stationary_var_{shock_spec['name']}"] = jnp.array(mean_val, dtype=_DEFAULT_DTYPE)
+        # Add other distributions if needed
+
+    # Stationary Cycle Correlation Cholesky (LKJCholesky mean is Identity)
+    if k_stationary > 1:
+         params_mean['stationary_chol'] = jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE)
+    # k_stationary <= 1 cases don't have this parameter sampled
+
+    # Trend Shock Variances (InverseGamma mean)
+    trend_shocks_parsed_spec = config_data['trend_shocks_parsed_spec']
+    for shock_spec in trend_shocks_parsed_spec:
+        if shock_spec['dist_idx'] == 0: # InverseGamma
+            mean_val = shock_spec['beta'] / (shock_spec['alpha'] - 1.0) if shock_spec['alpha'] > 1.0 else jnp.nan # Mean undefined if alpha <= 1
+            params_mean[f"trend_var_{shock_spec['name']}"] = jnp.array(mean_val, dtype=_DEFAULT_DTYPE)
+        # Add other distributions if needed
+
+    # Measurement Parameters (Normal mean mu, HalfNormal mean sigma * sqrt(2/pi))
+    measurement_params_parsed_spec = config_data['measurement_params_parsed_spec']
+    for param_spec in measurement_params_parsed_spec:
+        if param_spec['dist_idx'] == 0: # Normal
+            params_mean[param_spec['name']] = jnp.array(param_spec['mu'], dtype=_DEFAULT_DTYPE)
+        elif param_spec['dist_idx'] == 1: # HalfNormal (Mean = sigma * sqrt(2/pi))
+            mean_val = param_spec['sigma'] * jnp.sqrt(2.0 / jnp.pi)
+            params_mean[param_spec['name']] = jnp.array(mean_val, dtype=_DEFAULT_DTYPE)
+        # Add other distributions if needed
+
+    print("Prior mean parameters retrieved.")
+    return params_mean
+
+
+def get_prior_mode_params(config_path: str) -> Dict[str, jax.Array]:
+    """
+    Gets the prior mode parameter values from the configuration.
+
+    Args:
+        config_path: Path to the YAML configuration file.
+
+    Returns:
+        Dictionary of parameter values corresponding to the prior modes.
+    """
+    print("--- Getting Prior Mode Parameters ---")
+    config_data = load_config_and_prepare_jax_static_args(config_path)
+
+    params_mode = {}
+
+    # Stationary VAR Coefficients (A_diag, A_offdiag)
+    es_param_val, fs_param_val = config_data['stationary_hyperparams_es_fs_jax']
+    k_stationary = config_data['k_stationary']
+    p = config_data['var_order']
+    num_off_diag = config_data['num_off_diag']
+
+    params_mode['A_diag'] = jnp.full([p, k_stationary], es_param_val[0], dtype=_DEFAULT_DTYPE) # Mode of Normal is mean
+    if num_off_diag > 0:
+        params_mode['A_offdiag'] = jnp.full([p, num_off_diag], es_param_val[1], dtype=_DEFAULT_DTYPE) # Mode of Normal is mean
+
+    # Stationary Cycle Shock Variances (InverseGamma mode beta/(alpha+1))
+    stationary_shocks_parsed_spec = config_data['stationary_shocks_parsed_spec']
+    for shock_spec in stationary_shocks_parsed_spec:
+        if shock_spec['dist_idx'] == 0: # InverseGamma
+            mode_val = shock_spec['beta'] / (shock_spec['alpha'] + 1.0) # Mode defined for alpha > 0
+            params_mode[f"stationary_var_{shock_spec['name']}"] = jnp.array(mode_val, dtype=_DEFAULT_DTYPE)
+        # Add other distributions if needed
+
+    # Stationary Cycle Correlation Cholesky (LKJCholesky mode is Identity)
+    if k_stationary > 1:
+         params_mode['stationary_chol'] = jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE)
+    # k_stationary <= 1 cases don't have this parameter sampled
+
+    # Trend Shock Variances (InverseGamma mode)
+    trend_shocks_parsed_spec = config_data['trend_shocks_parsed_spec']
+    for shock_spec in trend_shocks_parsed_spec:
+        if shock_spec['dist_idx'] == 0: # InverseGamma
+            mode_val = shock_spec['beta'] / (shock_spec['alpha'] + 1.0) # Mode defined for alpha > 0
+            params_mode[f"trend_var_{shock_spec['name']}"] = jnp.array(mode_val, dtype=_DEFAULT_DTYPE)
+        # Add other distributions if needed
+
+    # Measurement Parameters (Normal mode mu, HalfNormal mode 0)
+    measurement_params_parsed_spec = config_data['measurement_params_parsed_spec']
+    for param_spec in measurement_params_parsed_spec:
+        if param_spec['dist_idx'] == 0: # Normal
+            params_mode[param_spec['name']] = jnp.array(param_spec['mu'], dtype=_DEFAULT_DTYPE)
+        elif param_spec['dist_idx'] == 1: # HalfNormal (Mode is 0 for sigma > 0)
+             mode_val = 0.0 # Mode is 0 for sigma > 0
+             params_mode[param_spec['name']] = jnp.array(mode_val, dtype=_DEFAULT_DTYPE)
+        # Add other distributions if needed
+
+    print("Prior mode parameters retrieved.")
+    return params_mode
+
+
+def plot_bvar_results(
+    data_df: pd.DataFrame,
+    config_path: str,
+    smoothed_states: jax.Array,
+    simulation_results: Union[jax.Array, Tuple[jax.Array, jax.Array, jax.Array]],
+    true_states_sim: Optional[Tuple[jax.Array, jax.Array, jax.Array]] = None, # (true_states, true_cycles, true_trends)
+    output_dir: Optional[str] = None,
+    show_plots: bool = True,
+    plot_obs_vs_fitted: bool = True
+):
+    """
+    Generates and optionally saves comparison plots for BVAR state-space estimation results.
+
+    Args:
+        data_df: Pandas DataFrame with data used for estimation (needed for dates and observed data).
+                 Must have a DatetimeIndex or PeriodIndex.
+        config_path: Path to the YAML configuration file.
+        smoothed_states: Smoothed state means from running the smoother (T, k_states).
+        simulation_results: Simulation smoother results (either single draw, or mean, median, all draws).
+                            Should be the second element returned by run_bvar_smoother.
+        true_states_sim: Optional tuple of true simulated states (full_states, cycles, trends)
+                         if plotting results from a simulation study.
+        output_dir: Directory to save plots. If None, plots are not saved.
+        show_plots: If True, display plots.
+        plot_obs_vs_fitted: If True, plot observed data vs fitted values.
+    """
+    print("--- Generating BVAR Results Plots ---")
+
+    # 1. Load Configuration to get names and dimensions
+    try:
+        config_data = load_config_and_prepare_jax_static_args(config_path)
+        observable_names = config_data['observable_names']
+        trend_var_names = config_data['trend_var_names']
+        stationary_var_names = config_data['stationary_var_names']
+        p = config_data['var_order']
+        k_trends = config_data['k_trends']
+        k_stationary = config_data['k_stationary']
+        k_states = config_data['k_states']
+
+        # Get state names consistent with the full state vector [trends, stationary_t, ..., stationary_t-p+1]
+        state_names_list = list(trend_var_names)
+        for lag in range(p):
+            for stat_var in stationary_var_names:
+                if lag == 0:
+                     state_names_list.append(stat_var)
+                else:
+                     state_names_list.append(f"{stat_var}_t_minus_{lag}")
+        state_names = tuple(state_names_list) # Use tuple for static reference
+
+    except Exception as e:
+        print(f"Error loading configuration for plotting: {e}")
+        return
+
+    # Extract data from simulation_results based on num_draws
+    if isinstance(simulation_results, tuple) and len(simulation_results) == 3:
+        mean_sim_states, median_sim_states, all_sim_draws = simulation_results
+        num_sim_draws = all_sim_draws.shape[0]
+    else: # Single draw case
+        mean_sim_states = simulation_results # The single draw serves as the 'mean' for plotting
+        median_sim_states = simulation_results # Use single draw as median proxy
+        all_sim_draws = None # No band plotting for single draw
+        num_sim_draws = 1
+
+
+    # Check for NaNs in plotting data
+    print(f"NaNs in smoothed_states: {jnp.any(jnp.isnan(smoothed_states))}")
+    print(f"NaNs in mean_sim_states: {jnp.any(jnp.isnan(mean_sim_states))}")
+    if num_sim_draws > 1:
+         print(f"NaNs in median_sim_states: {jnp.any(jnp.isnan(median_sim_states))}")
+         print(f"NaNs in all_sim_draws: {jnp.any(jnp.isnan(all_sim_draws))}")
+
+
+    # Prepare dates for plotting
+    dates = data_df.index
+    formatter = mdates.DateFormatter('%Y')
+
+    # Determine which states to plot (trends + current stationary cycles)
+    num_states_to_plot = k_trends + k_stationary
+    states_to_plot_indices = list(range(num_states_to_plot)) # Indices in the full state vector
+
+    # --- Plot States (Trends and Current Cycles) ---
+    print(f"Plotting {num_states_to_plot} states (Trends and Current Cycles)...")
+    fig_states, axes_states = plt.subplots(num_states_to_plot, 1, figsize=(12, 3 * num_states_to_plot), sharex=True)
+    if num_states_to_plot == 1:
+        axes_states = [axes_states] # Ensure axes is iterable even for 1 subplot
+
+    for i, state_idx in enumerate(states_to_plot_indices):
+        ax = axes_states[i]
+        state_name = state_names[state_idx] # Get the correct name from the full state names list
+
+        # Plot true state path if available
+        if true_states_sim is not None:
+            true_full_states, true_cycles_sim, true_trends_sim = true_states_sim
+            # Need to map state_idx to its corresponding index in true_trends_sim or true_cycles_sim
+            if state_idx < k_trends: # It's a trend
+                 true_path = true_trends_sim[:, state_idx]
+                 component_type = "True Trend"
+            elif state_idx < k_trends + k_stationary: # It's a current cycle
+                 true_path = true_cycles_sim[:, state_idx - k_trends]
+                 component_type = "True Cycle"
+            # Lagged cycles are not plotted here, but would use true_full_states[:, state_idx]
+            ax.plot(dates, true_path, label=component_type, color='black', linestyle='-', linewidth=2, alpha=0.7)
+
+
+        # Plot smoothed state mean
+        ax.plot(dates, smoothed_states[:, state_idx], label='Smoothed State Mean (Est)', color='blue', linestyle='--')
+
+        # Plot mean and median simulated states
+        ax.plot(dates, mean_sim_states[:, state_idx], label='Mean Sim State (Est)', color='red', linestyle=':')
+        if num_sim_draws > 1:
+            ax.plot(dates, median_sim_states[:, state_idx], label='Median Sim State (Est)', color='green', linestyle='-.')
+
+            # Plot simulation smoother band (e.g., 90% HDI)
+            try:
+                 # Need to use arviz.hdi, requires dataarray or similar shape
+                 # all_sim_draws[:, :, state_idx] is (num_draws, T_sim).
+                 # Need to reshape for arviz.wrap: (num_chains, num_samples_per_chain, T_sim)
+                 # We don't know the original num_chains/samples from `num_draws` directly.
+                 # Assume the draws are concatenated chains, treat as 1 chain for wrapping.
+                 T_sim_actual = all_sim_draws.shape[1] # Get time dimension from draws
+                 state_draws_reshaped = all_sim_draws[:, :, state_idx].reshape(1, num_sim_draws, T_sim_actual) # Treat as 1 chain
+
+                 state_draws_da = az.wrap(state_draws_reshaped, dims=['chain', 'draw', 'time'])
+                 # Handle potential NaNs in draws by filling them for HDI calculation if necessary
+                 # For now, let arviz handle skipna=True
+                 hdi_sim = az.hdi(state_draws_da, hdi_prob=0.90, skipna=True) 
+
+                 # Check if HDI computation resulted in NaNs (can happen with very bad draws)
+                 if jnp.all(jnp.isfinite(hdi_sim.sel(hdi='lower').values)) and jnp.all(jnp.isfinite(hdi_sim.sel(hdi='higher').values)):
+                    ax.fill_between(dates,
+                                    hdi_sim.sel(hdi='lower').values,
+                                    hdi_sim.sel(hdi='higher').values,
+                                    color='red', alpha=0.2, label='90% Sim Smoother Band')
+                 else:
+                      print(f"Warning: HDI computation resulted in NaNs/Infs for state {state_name}. Skipping band plot.")
+
+            except Exception as hdi_e:
+                 print(f"Warning: Could not compute/plot HDI for state {state_name}: {hdi_e}")
+                 # Fallback: just plot min/max range (less informative)
+                 try:
+                     min_draw = jnp.min(all_sim_draws[:, :, state_idx], axis=0)
+                     max_draw = jnp.max(all_sim_draws[:, :, state_idx], axis=0)
+                     if jnp.all(jnp.isfinite(min_draw)) and jnp.all(jnp.isfinite(max_draw)):
+                         ax.fill_between(dates, min_draw, max_draw, color='red', alpha=0.1, label='Sim Smoother Min/Max')
+                     else:
+                         print(f"Warning: Min/Max computation resulted in NaNs/Infs for state {state_name}. Skipping band plot.")
+                 except Exception as minmax_e:
+                      print(f"Error computing min/max for state {state_name}: {minmax_e}")
+
+
+        ax.set_title(f'State: {state_name}')
+        ax.legend(fontsize=8)
+        ax.grid(True)
+        ax.xaxis.set_major_formatter(formatter)
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+    plt.tight_layout()
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        plt.savefig(os.path.join(output_dir, 'bvar_states_plot.png'))
+        print(f"States plot saved to {os.path.join(output_dir, 'bvar_states_plot.png')}")
+    if show_plots:
+        plt.show()
+    else:
+        plt.close(fig_states)
+
+
+    # --- Plot Observed Data vs Fitted Values (Optional) ---
+    if plot_obs_vs_fitted:
+        print("Plotting observed data vs fitted values...")
+        # Need C matrix from the parameter set used for smoothing
+        # The single-draw routine doesn't return C, but we can rebuild it here
+        # for the single parameter set (posterior mean/mode).
+        # This requires parts of build_state_space_matrices_jit logic.
+        try:
+             # Reconstruct C matrix for the given parameter set using parts of build_state_space_matrices_jit's logic
+             # Requires mapping sampled param names to a structure usable by C matrix build.
+             # This is complex. A simpler approach is to assume the parameter dict `params`
+             # includes measurement parameters by name.
+             # Let's get the necessary info from the static config and the parameter dict.
+             measurement_param_names_tuple = config_data['measurement_param_names_tuple']
+             parsed_model_eqs_jax_detailed = config_data['parsed_model_eqs_jax_detailed']
+             trend_var_names_tuple = config_data['trend_var_names']
+             stationary_var_names_tuple = config_data['stationary_var_names']
+
+             # State indices for C matrix (Trends + Current Stationary Block)
+             state_indices_for_C_map = {name: i for i, name in enumerate(trend_var_names_tuple)} # Trends 0 to k_trends-1
+             state_indices_for_C_map.update({name: k_trends + i for i, name in enumerate(stationary_var_names_tuple)}) # Current Stationary k_trends to k_trends+k_stationary-1
+
+             # Get measurement parameters as an array, aligned with names tuple
+             measurement_params_array = jnp.array([
+                 params.get(name, 1.0) # Get from params dict, default 1.0 if missing
+                 for name in measurement_param_names_tuple
+             ], dtype=_DEFAULT_DTYPE) if measurement_param_names_tuple else jnp.empty((0,), dtype=_DEFAULT_DTYPE)
+
+
+             C_comp_rebuilt = jnp.zeros((k_endog, k_states), dtype=_DEFAULT_DTYPE)
+
+             for obs_idx, terms_for_obs in parsed_model_eqs_jax_detailed:
+                 for term_type, state_name_in_eq_str, param_idx_if_any, sign_val in terms_for_obs:
+                     state_idx_full_state = state_indices_for_C_map[state_name_in_eq_str] # Map name to index
+
+                     is_param_term_and_valid = (term_type == 1 and param_idx_if_any >= 0 and param_idx_if_any < measurement_params_array.shape[0] and measurement_params_array.size > 0)
+
+                     current_term_value = jnp.array(0.0, dtype=_DEFAULT_DTYPE)
+                     if term_type == 0: # Direct state term
+                         current_term_value = sign_val * 1.0
+                     elif is_param_term_and_valid: # Valid parameter term
+                         current_term_value = sign_val * measurement_params_array[param_idx_if_any]
+
+                     C_comp_rebuilt = C_comp_rebuilt.at[obs_idx, state_idx_full_state].add(current_term_value)
+
+
+             # Compute fitted values: y_fitted = C @ x_smoothed_mean
+             fitted_values = smoothed_states @ C_comp_rebuilt.T # (T, k_states) @ (k_states, k_endog).T
+
+             # Plot the observed variables
+             num_obs_to_plot = k_endog # Plot all observed variables
+             fig_obs, axes_obs = plt.subplots(num_obs_to_plot, 1, figsize=(12, 3 * num_obs_to_plot), sharex=True)
+             if num_obs_to_plot == 1:
+                  axes_obs = [axes_obs]
+
+             # Get original observed data from the DataFrame, respecting NaNs
+             data_observed_pd = data_df[list(observable_names)]
+
+
+             for i in range(num_obs_to_plot):
+                  ax = axes_obs[i]
+                  obs_name = observable_names[i]
+
+                  # Plot original observed data (handle NaNs via pandas plotting)
+                  ax.plot(dates, data_observed_pd[obs_name], label='Observed', color='gray', marker='.', linestyle='-', alpha=0.7)
+
+                  # Plot fitted/smoothed values
+                  ax.plot(dates, fitted_values[:, i], label='Fitted (C @ Smoothed Mean)', color='red')
+
+                  ax.set_title(f'Observed vs Fitted: {obs_name}')
+                  ax.legend(fontsize=8)
+                  ax.grid(True)
+                  ax.xaxis.set_major_formatter(formatter)
+                  plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+             plt.tight_layout()
+             if output_dir:
+                 os.makedirs(output_dir, exist_ok=True)
+                 plt.savefig(os.path.join(output_dir, 'bvar_obs_fitted_plot.png'))
+                 print(f"Observed vs Fitted plot saved to {os.path.join(output_dir, 'bvar_obs_fitted_plot.png')}")
+             if show_plots:
+                 plt.show()
+             else:
+                  plt.close(fig_obs)
+
+
+        except Exception as e:
+              print(f"Error during plotting observed vs fitted: {e}")
+
+
+def simulate_bvar_data(
+    config_path: str,
+    key: jax.random.PRNGKey,
+    T_sim: int,
+    true_params: Optional[Dict[str, jax.Array]] = None
+) -> Tuple[pd.DataFrame, Tuple[jax.Array, jax.Array, jax.Array]]:
+    """
+    Simulates data from the BVAR model structure defined in the config file.
+
+    Args:
+        config_path: Path to the YAML configuration file.
+        key: JAX random key for simulation.
+        T_sim: Number of time steps to simulate.
+        true_params: Optional dictionary of true parameters to use for simulation.
+                     If None, parameters are defined based on calibrated defaults.
+
+    Returns:
+        Tuple: (simulated_data_df, true_states_tuple)
+        simulated_data_df: Pandas DataFrame containing simulated observable data.
+        true_states_tuple: Tuple of (true_full_states, true_cycles, true_trends) JAX arrays.
+    """
+    print(f"--- Simulating BVAR Data for {T_sim} steps ---")
+    start_time = time.time()
+
+    # 1. Load Configuration and Prepare Static Arguments
+    print("Loading configuration and preparing static JAX arguments...")
+    config_data = load_config_and_prepare_jax_static_args(config_path)
+    print("Configuration loaded.")
+
+    # 2. Define True Parameters
+    print("Defining true parameters...")
+    if true_params is None:
+        true_params_for_sim = define_true_params(config_data)
+    else:
+        # Use provided true_params, ensuring they have correct structure/keys
+        # Basic check for expected keys
+        expected_keys = ['Phi_list', 'Sigma_cycles_sim', 'Sigma_trends_sim', 'measurement_params']
+        if not all(key in true_params for key in expected_keys):
+            print(f"Warning: Provided true_params dict is missing expected keys. Using defaults.")
+            true_params_for_sim = define_true_params(config_data)
+        else:
+            true_params_for_sim = true_params
+
+    # 3. Run Simulation
+    print("Running simulation...")
+    sim_key = random.split(key)[0] # Use a split key for simulation
+
+    simulated_obs_jax, true_full_states_jax, true_cycles_jax, true_trends_jax = simulate_bvar_with_trends_jax(
+        sim_key,
+        T_sim, # Static arg
+        static_config_data=config_data, # Static arg
+        true_phi_list=true_params_for_sim['Phi_list'],
+        true_sigma_cycles=true_params_for_sim['Sigma_cycles_sim'],
+        true_sigma_trends_sim=true_params_for_sim['Sigma_trends_sim'],
+        true_measurement_params_dict=true_params_for_sim['measurement_params']
+    )
+
+    end_time = time.time()
+    print(f"Data simulation completed in {end_time - start_time:.2f} seconds.")
+    print(f"Simulated data shape: {simulated_obs_jax.shape}")
+    print(f"True states shape: {true_full_states_jax.shape}")
+
+
+    # 4. Convert to Pandas DataFrame for easier handling/plotting
+    observable_names = config_data['observable_names']
+    # Create a dummy pandas DataFrame for plotting with dates
+    # Start date and frequency can be made configurable if needed
+    try:
+        # Attempt to use quarterly frequency if it makes sense, otherwise default to Period(0).to_timestamp()
+        dummy_dates = pd.period_range(start='1800Q1', periods=T_sim, freq='Q').to_timestamp()
+    except Exception:
+        dummy_dates = pd.Index([pd.Period(i).to_timestamp() for i in range(T_sim)]) # Fallback if PeriodIndex fails
+
+    simulated_data_df = pd.DataFrame(simulated_obs_jax, index=dummy_dates, columns=list(observable_names)) # Ensure columns are list
+
+    true_states_tuple = (true_full_states_jax, true_cycles_jax, true_trends_jax)
+
+    return simulated_data_df, true_states_tuple
+
+
+```
+
+**File 8: `example_script.py`** (New file demonstrating the usage of `bvar_tools.py` functions)
+```python
+# --- example_script.py ---
+# Example script demonstrating the usage of bvar_tools.py functions.
+
+import jax
+import jax.numpy as jnp
+import jax.random as random
+import pandas as pd
+import os
+import matplotlib.pyplot as plt # Ensure matplotlib is imported if plots are shown
+
+# Assuming bvar_tools.py, bvar_simulation.py, var_ss_model.py, and utils are accessible
+from bvar_tools import estimate_bvar_mcmc, run_bvar_smoother, get_prior_mean_params, get_prior_mode_params, plot_bvar_results, simulate_bvar_data
+# You might need to import specific constants if they aren't handled via config
+# from var_ss_model import _DEFAULT_DTYPE
+
+
+# --- Configuration and Setup ---
+# Define paths relative to the script location
+# Adjust these paths as needed for your project structure
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, 'bvar_stationary_calibrated.yml') # Use the calibrated config
+DATA_PATH_REAL = os.path.join(SCRIPT_DIR, 'data_m5.csv') # Example real data if available
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'bvar_output')
+
+# Ensure output directory exists
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Set a random key for reproducibility
+RANDOM_KEY = random.PRNGKey(42)
+
+# Set JAX config (optional, for consistency)
+jax.config.update("jax_enable_x64", True)
+# jax.config.update("jax_platform_name", "cpu")
+
+# --- 1. Simulate Data (using bvar_simulation.py via bvar_tools.py) ---
+print("\n--- Step 1: Simulating Data ---")
+T_SIMULATION = 100 # Number of time steps to simulate
+key_sim, RANDOM_KEY = random.split(RANDOM_KEY) # Split key for simulation
+
+try:
+    # Simulate data and get true states
+    simulated_data_df, true_states_tuple = simulate_bvar_data(
+        config_path=CONFIG_PATH,
+        key=key_sim,
+        T_sim=T_SIMULATION,
+        true_params=None # Use default defined in bvar_simulation.define_true_params
+    )
+    true_full_states_sim, true_cycles_sim, true_trends_sim = true_states_tuple
+
+    print(f"\nSimulated data generated for {T_SIMULATION} time steps.")
+    print(f"Simulated data head:\n{simulated_data_df.head()}")
+
+    # Optional: Save simulated data
+    simulated_data_df.to_csv(os.path.join(OUTPUT_DIR, 'simulated_bvar_data.csv'), index=True)
+    print(f"\nSimulated data saved to {os.path.join(OUTPUT_DIR, 'simulated_bvar_data.csv')}")
+
+except Exception as e:
+    print(f"\nError during data simulation: {e}")
+    simulated_data_df = None # Set to None if simulation failed
+    true_states_tuple = None
+
+
+# --- 2. Estimate Model using MCMC (on Simulated Data) ---
+if simulated_data_df is not None:
+    print("\n--- Step 2: Estimating Model (on Simulated Data) ---")
+    key_mcmc, RANDOM_KEY = random.split(RANDOM_KEY) # Split key for MCMC
+
+    # MCMC settings (can be adjusted)
+    num_warmup = 200 # Reduce for faster example
+    num_samples = 400 # Reduce for faster example
+    num_chains = 2
+
+    try:
+        posterior_samples_sim = estimate_bvar_mcmc(
+            data_df=simulated_data_df,
+            config_path=CONFIG_PATH,
+            key=key_mcmc,
+            num_warmup=num_warmup,
+            num_samples=num_samples,
+            num_chains=num_chains
+        )
+        print("\nMCMC Estimation on Simulated Data Complete.")
+
+        # Optional: Save posterior samples
+        # This can be large. Saving as JSON/CSV can be complex for dict of arrays.
+        # ArviZ InferenceData objects are better for analysis and saving.
+        # idata_sim = az.from_numpyro(mcmc_object) # Need access to mcmc object
+        # idata_sim.to_netcdf(...)
+
+    except Exception as e:
+        print(f"\nError during MCMC estimation on simulated data: {e}")
+        posterior_samples_sim = None
+else:
+    print("\n--- Step 2 Skipped: Data Simulation Failed ---")
+    posterior_samples_sim = None
+
+
+# --- 3. Run Smoother with Posterior Mean Parameters (on Simulated Data) ---
+if posterior_samples_sim is not None:
+    print("\n--- Step 3: Running Smoother with Posterior Mean (on Simulated Data) ---")
+    key_smooth_post_mean, RANDOM_KEY = random.split(RANDOM_KEY) # Split key for smoother
+
+    # Get posterior mean for sampled parameters
+    # Need to list sampled parameter names based on the model
+    # (This list should match the names used in numpyro_bvar_stationary_model)
+    # A simpler way is to get keys from posterior_samples and exclude deterministics
+    sampled_param_names = [
+        name for name in posterior_samples_sim.keys()
+        if not name.endswith('_det') and name not in ['log_likelihood', 'phi_list',
+        'Sigma_cycles', 'Sigma_trends', 'T_comp', 'R_comp', 'C_comp', 'H_comp',
+        'init_x_comp', 'init_P_comp', 'A_draws', 'k_states']
+    ]
+
+    posterior_mean_params = {
+        name: jnp.mean(posterior_samples_sim[name], axis=0)
+        for name in sampled_param_names
+        if name in posterior_samples_sim # Safeguard
+    }
+    print("\nPosterior mean parameters calculated.")
+
+    num_smoother_draws = 200 # Number of draws for the smoother band
+
+    try:
+        smoothed_states_post_mean_sim, sim_results_post_mean_sim = run_bvar_smoother(
+            params=posterior_mean_params,
+            data_df=simulated_data_df, # Use the simulated data
+            config_path=CONFIG_PATH,
+            key=key_smooth_post_mean,
+            num_draws=num_smoother_draws
+        )
+        print("\nSmoother run with posterior mean parameters complete.")
+
+    except Exception as e:
+        print(f"\nError during smoother run with posterior mean: {e}")
+        smoothed_states_post_mean_sim = None
+        sim_results_post_mean_sim = None
+else:
+    print("\n--- Step 3 Skipped: MCMC Estimation Failed ---")
+    smoothed_states_post_mean_sim = None
+    sim_results_post_mean_sim = None
+
+
+# --- 4. Plot Results (Smoothed/Simulated vs True States for Simulated Data) ---
+if simulated_data_df is not None and smoothed_states_post_mean_sim is not None and true_states_tuple is not None:
+    print("\n--- Step 4: Plotting Results (Simulated Data) ---")
+    try:
+        # Plotting for simulated data includes comparison to true states
+        plot_bvar_results(
+            data_df=simulated_data_df, # For dates and observed data (optional plot)
+            config_path=CONFIG_PATH,
+            smoothed_states=smoothed_states_post_mean_sim, # Smoothed means from original data
+            simulation_results=sim_results_post_mean_sim, # Smoother draws/stats
+            true_states_sim=true_states_tuple, # Pass true states for comparison
+            output_dir=OUTPUT_DIR, # Save plots
+            show_plots=True, # Display plots
+            plot_obs_vs_fitted=False # Skip observed vs fitted for simulation study
+        )
+        print("\nPlotting for simulated data complete.")
+    except Exception as e:
+        print(f"\nError during plotting simulated data results: {e}")
+
+
+# --- 5. Run Smoother with Prior Mean Parameters (on Simulated Data) ---
+if simulated_data_df is not None:
+    print("\n--- Step 5: Running Smoother with Prior Mean (on Simulated Data) ---")
+    key_smooth_prior_mean, RANDOM_KEY = random.split(RANDOM_KEY) # Split key
+
+    try:
+        prior_mean_params = get_prior_mean_params(config_path=CONFIG_PATH)
+        print("\nPrior mean parameters:")
+        # print(prior_mean_params) # Optional: print parameters
+
+        # Run smoother with prior mean
+        smoothed_states_prior_mean_sim, sim_results_prior_mean_sim = run_bvar_smoother(
+            params=prior_mean_params,
+            data_df=simulated_data_df, # Use the simulated data
+            config_path=CONFIG_PATH,
+            key=key_smooth_prior_mean,
+            num_draws=num_smoother_draws # Use same number of draws
+        )
+        print("\nSmoother run with prior mean parameters complete.")
+
+        # Optional: Plotting results with prior mean (can compare to true states)
+        # print("\nPlotting results with Prior Mean (Simulated Data)...")
+        # plot_bvar_results(
+        #     data_df=simulated_data_df,
+        #     config_path=CONFIG_PATH,
+        #     smoothed_states=smoothed_states_prior_mean_sim,
+        #     simulation_results=sim_results_prior_mean_sim,
+        #     true_states_sim=true_states_tuple,
+        #     output_dir=OUTPUT_DIR,
+        #     show_plots=True,
+        #     plot_obs_vs_fitted=False
+        # )
+        # print("\nPlotting with prior mean complete.")
+
+
+    except Exception as e:
+        print(f"\nError during smoother run with prior mean: {e}")
+
+
+# --- 6. Run Smoother with Prior Mode Parameters (on Simulated Data) ---
+if simulated_data_df is not None:
+    print("\n--- Step 6: Running Smoother with Prior Mode (on Simulated Data) ---")
+    key_smooth_prior_mode, RANDOM_KEY = random.split(RANDOM_KEY) # Split key
+
+    try:
+        prior_mode_params = get_prior_mode_params(config_path=CONFIG_PATH)
+        print("\nPrior mode parameters:")
+        # print(prior_mode_params) # Optional: print parameters
+
+        # Run smoother with prior mode
+        smoothed_states_prior_mode_sim, sim_results_prior_mode_sim = run_bvar_smoother(
+            params=prior_mode_params,
+            data_df=simulated_data_df, # Use the simulated data
+            config_path=CONFIG_PATH,
+            key=key_smooth_prior_mode,
+            num_draws=num_smoother_draws # Use same number of draws
+        )
+        print("\nSmoother run with prior mode parameters complete.")
+
+        # Optional: Plotting results with prior mode (can compare to true states)
+        # print("\nPlotting results with Prior Mode (Simulated Data)...")
+        # plot_bvar_results(
+        #     data_df=simulated_data_df,
+        #     config_path=CONFIG_PATH,
+        #     smoothed_states=smoothed_states_prior_mode_sim,
+        #     simulation_results=sim_results_prior_mode_sim,
+        #     true_states_sim=true_states_tuple,
+        #     output_dir=OUTPUT_DIR,
+        #     show_plots=True,
+        #     plot_obs_vs_fitted=False
+        # )
+        # print("\nPlotting with prior mode complete.")
+
+    except Exception as e:
+        print(f"\nError during smoother run with prior mode: {e}")
+
+
+# --- 7. Estimate Model using MCMC (on Real Data - Optional) ---
+# Check if real data file exists before attempting
+if os.path.exists(DATA_PATH_REAL):
+    print("\n--- Step 7: Estimating Model (on Real Data) ---")
+    key_mcmc_real, RANDOM_KEY = random.split(RANDOM_KEY) # Split key
+
+    try:
+        print(f"Loading real data from {DATA_PATH_REAL}...")
+        data_real_df = pd.read_csv(DATA_PATH_REAL)
+        # Assume 'Date' column is present and needs converting to PeriodIndex then DatetimeIndex
+        data_real_df['Date'] = pd.PeriodIndex(data_real_df['Date'], freq='Q').to_timestamp()
+        data_real_df = data_real_df.set_index('Date')
+        print("Real data loaded.")
+
+        # MCMC settings (can be adjusted)
+        num_warmup = 500
+        num_samples = 1000
+        num_chains = 2
+
+        posterior_samples_real = estimate_bvar_mcmc(
+            data_df=data_real_df,
+            config_path=CONFIG_PATH,
+            key=key_mcmc_real,
+            num_warmup=num_warmup,
+            num_samples=num_samples,
+            num_chains=num_chains
+        )
+        print("\nMCMC Estimation on Real Data Complete.")
+
+    except Exception as e:
+        print(f"\nError during MCMC estimation on real data: {e}")
+        posterior_samples_real = None
+        data_real_df = None # Ensure data_real_df is None if loading failed
+else:
+    print(f"\n--- Step 7 Skipped: Real Data file not found at {DATA_PATH_REAL} ---")
+    posterior_samples_real = None
+    data_real_df = None
+
+
+# --- 8. Run Smoother with Posterior Mean Parameters (on Real Data - Optional) ---
+if posterior_samples_real is not None and data_real_df is not None:
+    print("\n--- Step 8: Running Smoother with Posterior Mean (on Real Data) ---")
+    key_smooth_post_mean_real, RANDOM_KEY = random.split(RANDOM_KEY) # Split key
+
+    # Get posterior mean for sampled parameters (using real data samples)
+    sampled_param_names_real = [
+        name for name in posterior_samples_real.keys()
+        if not name.endswith('_det') and name not in ['log_likelihood', 'phi_list',
+        'Sigma_cycles', 'Sigma_trends', 'T_comp', 'R_comp', 'C_comp', 'H_comp',
+        'init_x_comp', 'init_P_comp', 'A_draws', 'k_states']
+    ]
+
+    posterior_mean_params_real = {
+        name: jnp.mean(posterior_samples_real[name], axis=0)
+        for name in sampled_param_names_real
+        if name in posterior_samples_real
+    }
+    print("\nPosterior mean parameters (Real Data) calculated.")
+
+    num_smoother_draws_real = 500 # More draws for potentially final results
+
+    try:
+        smoothed_states_post_mean_real, sim_results_post_mean_real = run_bvar_smoother(
+            params=posterior_mean_params_real,
+            data_df=data_real_df, # Use the real data
+            config_path=CONFIG_PATH,
+            key=key_smooth_post_mean_real,
+            num_draws=num_smoother_draws_real
+        )
+        print("\nSmoother run with posterior mean parameters (Real Data) complete.")
+
+    except Exception as e:
+        print(f"\nError during smoother run with posterior mean (Real Data): {e}")
+        smoothed_states_post_mean_real = None
+        sim_results_post_mean_real = None
+else:
+    print("\n--- Step 8 Skipped: Real Data Estimation Failed or Data Not Found ---")
+    smoothed_states_post_mean_real = None
+    sim_results_post_mean_real = None
+
+
+# --- 9. Plot Results (Smoothed/Simulated for Real Data - Optional) ---
+if data_real_df is not None and smoothed_states_post_mean_real is not None:
+    print("\n--- Step 9: Plotting Results (Real Data) ---")
+    try:
+        # Plotting for real data does *not* include comparison to true states
+        plot_bvar_results(
+            data_df=data_real_df, # For dates and observed data (optional plot)
+            config_path=CONFIG_PATH,
+            smoothed_states=smoothed_states_post_mean_real, # Smoothed means from original data
+            simulation_results=sim_results_post_mean_real, # Smoother draws/stats
+            true_states_sim=None, # No true states for real data
+            output_dir=OUTPUT_DIR, # Save plots
+            show_plots=True, # Display plots
+            plot_obs_vs_fitted=True # Plot observed vs fitted for real data
+        )
+        print("\nPlotting for real data complete.")
+    except Exception as e:
+        print(f"\nError during plotting real data results: {e}")
+else:
+    print("\n--- Step 9 Skipped: Real Data Smoother Failed or Data Not Found ---")
+
+
+print("\n--- Example Script Finished ---")
+
+```
+
+**File 9: `bvar_stationary_calibrated.yml`** (Copy of input_file_8.py, using this name for the example script)
+```yaml
+# (Content of input_file_8.py)
+```
+
+**To Run This Example:**
+
+1.  Save the code blocks above into their respective Python files (`var_ss_model.py`, `run_single_draw.py`, `bvar_simulation.py`, `bvar_tools.py`, `example_script.py`). Place `Kalman_filter_jax.py`, `stationary_prior_jax_simplified.py`, and `hybrid_dk_smoother.py` in a subdirectory named `utils`. Save the YAML content into `bvar_stationary_calibrated.yml`.
+2.  Ensure you have `jax`, `jaxlib`, `numpyro`, `arviz`, `matplotlib`, `pandas`, and `pyyaml` installed (`pip install jax jaxlib numpyro arviz matplotlib pandas pyyaml`).
+3.  Ensure you have the `data_m5.csv` file available in the same directory as the `example_script.py` and `bvar_stationary_calibrated.yml` files (or update the `DATA_PATH_REAL` in `example_script.py`). The content of `data_m5.csv` is not provided, but the script expects a CSV with at least a 'Date' column (parseable as quarterly periods like '1800Q1') and columns for the observable variables specified in the YAML (`gdp`, `inf`).
+4.  Run `python example_script.py` from your terminal.
+
+This structure provides clear functions for each step of the process, making the workflow more modular and easier to use or adapt for different data/configurations. The `config_data` dictionary acts as a central hub for all static information derived from the YAML, simplifying function signatures where possible.

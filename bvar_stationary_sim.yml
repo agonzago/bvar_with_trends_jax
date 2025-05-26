@@ -1,0 +1,113 @@
+# --- bvar_stationary_calibrated.yml ---
+# Calibrated configuration matching the simulation data generating process
+
+model_info:
+  name: "BVAR with Stationary Prior - Calibrated"
+  description: "Two-variable BVAR model calibrated to simulation DGP"
+
+variables:
+  observable:
+    - name: "gdp"
+      description: "Real GDP"
+    - name: "inf"
+      description: "Inflation rate"
+  trends:
+    - name: "trend_gdp"
+      description: "GDP trend component"
+    - name: "trend_inf"
+      description: "Inflation trend component"
+  stationary:
+    - name: "cycle_gdp"
+      description: "GDP cyclical component"
+    - name: "cycle_inf"
+      description: "Inflation cyclical component"
+
+var_order: 1
+prior_type: "stationary"
+
+stationary_prior:
+  hyperparameters:
+    # Priors for A parameters (before transformation to Phi)
+    # True Phi = [[0.7, 0.2], [0.1, 0.5]], True Sigma_cycles = [[0.5, 0.1], [0.1, 0.5]]
+    # The mapping from Phi, Sigma to A is non-linear (inverse stationary transformation).
+    # Setting means of A directly to match implied A from true Phi/Sigma is complex.
+    # Let's use priors that roughly reflect the scale and structure, maybe tighten fs.
+    # Original: es: [0.6, 0.15], fs: [0.25, 0.20]
+    # Keep these or slightly adjust es towards elements of true Phi
+    es: [0.6, 0.15] # Mean for diagonal A, Mean for off-diagonal A
+    fs: [0.15, 0.15] # Std Dev for diagonal A, Std Dev for off-diagonal A (Tighter)
+    gs: [3.0, 3.0]   # Gamma shape parameters for precision (alpha in IG is gs+1)
+    hs: [1.0, 1.0]   # Gamma scale parameters for precision (beta in IG is hs)
+                     # Priors on A ~ N(es, 1/sqrt(lambda)), lambda ~ Gamma(gs, hs)
+                     # E[1/sqrt(lambda)] = sqrt(hs) * gamma(gs-0.5)/gamma(gs) for gs > 0.5
+                     # This part of the prior structure is complex; focusing on es/fs.
+
+  covariance_prior:
+    # LKJ concentration parameter for the CORRELATION matrix of cycles.
+    # True Sigma_cycles=[[0.5, 0.1],[0.1, 0.5]] implies correlation 0.1/0.5 = 0.2.
+    # eta=1 -> uniform correlation. Higher eta -> pushes corr towards 0.
+    # Since true correlation is 0.2 (non-zero), using a moderate eta > 1 makes sense for regularization.
+    # Let's try slightly higher eta to push correlation towards zero, but not too strongly.
+    eta: 2.0
+
+  stationary_shocks:
+    # Inverse Gamma priors for STATIONARY CYCLE VARIANCES (diagonal elements of Sigma_cycles).
+    # IG(alpha, beta): Mean = beta / (alpha - 1), Mode = beta / (alpha + 1)
+    # We want priors whose mean/mode is near the true variances (0.5 and 0.5).
+    # Using alpha = 10 for tighter prior (stdev of IG is beta / ((alpha-1)*sqrt(alpha-2))).
+    # Mean = beta / 9. beta = Mean * 9.
+    cycle_gdp:
+        distribution: "inverse_gamma"
+        parameters:
+          # True variance: 0.5. Desired mean: 0.5. alpha=10 -> beta = 0.5 * 9 = 4.5
+          alpha: 10.0
+          beta: 4.5
+    cycle_inf:
+        distribution: "inverse_gamma"
+        parameters:
+          # True variance: 0.5. Desired mean: 0.5. alpha=10 -> beta = 0.5 * 9 = 4.5
+          alpha: 10.0
+          beta: 4.5
+
+trend_shocks:
+  trend_shocks:
+    # Inverse Gamma priors for TREND VARIANCES.
+    # IG(alpha, beta): Mean = beta / (alpha - 1), Mode = beta / (alpha + 1)
+    # We want priors whose mean/mode is near the true variances (0.01 and 0.04).
+    # Using alpha = 10 for tighter prior. Mean = beta / 9. beta = Mean * 9.
+    trend_gdp:
+      distribution: "inverse_gamma"
+      parameters:
+        # True variance: 0.01. Desired mean: 0.01. alpha=10 -> beta = 0.01 * 9 = 0.09
+        alpha: 10.0
+        beta: 0.09
+    trend_inf:
+      distribution: "inverse_gamma"
+      parameters:
+        # True variance: 0.04. Desired mean: 0.04. alpha=10 -> beta = 0.04 * 9 = 0.36
+        alpha: 10.0
+        beta: 0.36
+
+model_equations:
+  - gdp: "trend_gdp + cycle_gdp"
+  - inf: "trend_inf + cycle_inf"
+
+initial_conditions:
+  states:
+    # These should match how the simulation initializes the state at t=0
+    # Based on your simulate_bvar_data (NumPy version), trends start at [2.0, 2.5], stationary at [0, 0]
+    # The JAX simulation version likely also uses these if derived from the YAML.
+    # Let's use the means [2.0, 2.5, 0.0, 0.0] for the full state vector if p=1.
+    # The variances should reflect initial uncertainty. Let's use reasonable, potentially tighter values.
+    trend_gdp:
+      mean: 2.0
+      var: 0.2  # Tighter initial variance for trend
+    trend_inf:
+      mean: 2.5
+      var: 0.2  # Tighter initial variance for trend
+    cycle_gdp:
+      mean: 0.0
+      var: 0.1  # Tighter initial variance for cycle
+    cycle_inf:
+      mean: 0.0
+      var: 0.1  # Tighter initial variance for cycle
