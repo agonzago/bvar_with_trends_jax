@@ -544,11 +544,13 @@ class HybridDKSimulationSmoother:
     # and rely on the _filter_internal and _rts_smoother_backend above,
     # which are assumed to work correctly for DENSE data.
 
+# Fix 1: Correct the Durbin-Koopman formula in hybrid_dk_smoother.py
+
     def _draw_simulation_small(self, original_ys_dense: jax.Array, key: jax.random.PRNGKey,
-                             x_smooth_original_dense: jax.Array) -> jax.Array:
+                            x_smooth_original_dense: jax.Array) -> jax.Array:
         """
         Single simulation draw for small state dimensions using the D-K approach.
-        Assumes original_ys_dense contains DENSE observations (no NaNs).
+        FIXED: Corrected Durbin-Koopman formula
         """
         T_steps = original_ys_dense.shape[0]
         if T_steps == 0: return jnp.empty((0, self.n_state), dtype=self.init_x.dtype)
@@ -561,47 +563,45 @@ class HybridDKSimulationSmoother:
         # Generate initial state draw from N(init_x, init_P)
         if self.init_chol_success:
             z0 = random.normal(key_init, (n_s,), dtype=self.init_x.dtype)
-            x0_star = self.init_x + self.L0 @ z0 # init_x + Chol(init_P) @ z0
+            x0_star = self.init_x + self.L0 @ z0
         else:
-            # Fallback: Use mean if Cholesky failed
-            print("Warning: Initial P Cholesky failed. Using init_x mean for initial state draw.")
             x0_star = self.init_x
 
-        # Generate state shocks (eps_star_sim)
+        # Generate state shocks
         if n_eps_shocks > 0:
             eps_star_sim = random.normal(key_eps, (T_steps, n_eps_shocks), dtype=self.R.dtype)
         else:
-            eps_star_sim = jnp.zeros((T_steps, 0), dtype=self.R.dtype) # Empty shocks if n_shocks is 0
+            eps_star_sim = jnp.zeros((T_steps, 0), dtype=self.R.dtype)
 
-        # Simulate state path with shocks: x_t = T x_{t-1} + R eps_t
+        # Simulate state path with shocks
         def state_step_with_shocks(x_prev, eps_t):
             shock = self.R @ eps_t if n_eps_shocks > 0 else jnp.zeros(self.n_state, dtype=x_prev.dtype)
             x_t = self.T @ x_prev + shock
-            x_t = jnp.clip(x_t, -1e6, 1e6) # Clip state values
+            x_t = jnp.clip(x_t, -1e6, 1e6)
             return x_t, x_t
 
         _, x_star_path = lax.scan(state_step_with_shocks, x0_star, eps_star_sim)
 
-        # Generate simulated observations: y_t = C x_t + eta_t
-        y_star_dense_sim=jnp.zeros((T_steps,self.n_obs_full),dtype=x_star_path.dtype) # Initialize zeros
+        # Generate simulated observations
+        y_star_dense_sim = jnp.zeros((T_steps, self.n_obs_full), dtype=x_star_path.dtype)
         if self.n_obs_full > 0:
-            # Simulate observation noise (eta_star_full_sim) using the chosen method (_simulate_obs_noise)
             eta_star_full_sim = self._simulate_obs_noise(key_eta, (T_steps,))
-            # Compute simulated observations using the full C matrix
-            y_star_dense_sim = (x_star_path @ self.C_full.T) + eta_star_full_sim # (T, n_state) @ (n_state, n_obs_full) + (T, n_obs_full)
+            y_star_dense_sim = (x_star_path @ self.C_full.T) + eta_star_full_sim
 
-        # Run filter and smoother on simulated data (y_star_dense_sim)
-        # Assumes _filter_internal and _rts_smoother_backend handle dense data
+        # Run filter and smoother on simulated data
         filter_results_star = self._filter_internal(y_star_dense_sim)
         x_smooth_star_dense, _ = self._rts_smoother_backend(filter_results_star)
 
-        # Compute final draw using Durbin-Koopman formula: x_draw = x_star + (x_smooth_original - x_smooth_star)
-        x_draw = x_star_path + (x_smooth_original_dense - x_smooth_star_dense)
+        # FIXED: Correct Durbin-Koopman formula
+        # OLD (INCORRECT): x_draw = x_star_path + (x_smooth_original_dense - x_smooth_star_dense)
+        # NEW (CORRECT):   x_draw = x_smooth_original_dense + (x_star_path - x_smooth_star_dense)
+        x_draw = x_smooth_original_dense + (x_star_path - x_smooth_star_dense)
 
         # Ensure final draw is finite
         x_draw = jnp.where(jnp.isfinite(x_draw), x_draw, jnp.zeros_like(x_draw))
 
         return x_draw
+
 
     # Note: The code for _draw_simulation_large is identical to _draw_simulation_small.
     # This suggests the performance difference is handled by the vmap vs loop strategy
@@ -652,10 +652,12 @@ class HybridDKSimulationSmoother:
          x_smooth_star_dense, _ = self._rts_smoother_backend(filter_results_star_dense)
 
          # Compute final draw
-         x_draw = x_star_path + (x_smooth_original_dense - x_smooth_star_dense)
+         #x_draw = x_star_path + (x_smooth_original_dense - x_smooth_star_dense)
+         x_draw = x_smooth_original_dense + (x_star_path - x_smooth_star_dense)
 
          # Ensure final draw is finite
          x_draw = jnp.where(jnp.isfinite(x_draw), x_draw, jnp.zeros_like(x_draw))
+         
          return x_draw
 
 

@@ -1,0 +1,62 @@
+var_order: 1
+variables:
+  observables:
+  - gdp_growth
+  - inflation
+  trends:
+  - trend_gdp_growth
+  - trend_inflation
+  stationary:
+  - cycle_gdp_growth
+  - cycle_inflation
+model_equations:
+  gdp_growth: trend_gdp_growth + cycle_gdp_growth
+  inflation: trend_inflation + cycle_inflation
+initial_conditions:
+  states:
+    trend_gdp_growth:
+      mean: 0.011153652016843414
+      var: 4.558692971968271e-07
+    cycle_gdp_growth:
+      mean: 0.001995343045430302
+      var: 0.00016526888141072814
+    trend_inflation:
+      mean: 0.005297058413192682
+      var: 1.583514487800792e-06
+    cycle_inflation:
+      mean: -0.006864093294068123
+      var: 0.00026992950162756915
+stationary_prior:
+  hyperparameters:
+    es:
+    - 0.7
+    - 0.15
+    fs:
+    - 0.2
+    - 0.15
+  covariance_prior:
+    eta: 1.5
+  stationary_shocks:
+    cycle_gdp_growth:
+      distribution: inverse_gamma
+      parameters:
+        alpha: 2.1
+        beta: 0.00014820422903734766
+    cycle_inflation:
+      distribution: inverse_gamma
+      parameters:
+        alpha: 2.1
+        beta: 0.0003508819022407461
+trend_shocks:
+  trend_shocks:
+    trend_gdp_growth:
+      distribution: inverse_gamma
+      parameters:
+        alpha: 2.1
+        beta: 3.2521758458749104e-06
+    trend_inflation:
+      distribution: inverse_gamma
+      parameters:
+        alpha: 2.1
+        beta: 1.8094743899704983e-06
+parameters: []

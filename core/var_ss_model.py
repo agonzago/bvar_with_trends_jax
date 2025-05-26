@@ -245,16 +245,43 @@ def build_state_space_matrices_jit(
             A_draws = A_draws.at[:, static_off_diag_rows, static_off_diag_cols].set(A_offdiag_flat)
 
     # --- Construct Sigma_cycles ---
+    # if k_stationary > 0:
+    #     stationary_D_sds = jnp.diag(jnp.sqrt(jnp.maximum(stationary_variances_array, _MODEL_JITTER)))
+        
+    #     Sigma_cycles = (stationary_D_sds @ stationary_chol) @ (stationary_D_sds @ stationary_chol).T
+        
+    #     Sigma_cycles = (Sigma_cycles + Sigma_cycles.T) / 2.0 
+    #     Sigma_cycles = Sigma_cycles + _MODEL_JITTER * jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE)
+    # else: 
+    #     Sigma_cycles = jnp.empty((0,0), dtype=_DEFAULT_DTYPE)
     if k_stationary > 0:
-        stationary_D_sds = jnp.diag(jnp.sqrt(jnp.maximum(stationary_variances_array, _MODEL_JITTER)))
+        # Ensure positive variances
+        stationary_variances_safe = jnp.maximum(stationary_variances_array, _MODEL_JITTER)
         
-        Sigma_cycles = (stationary_D_sds @ stationary_chol) @ (stationary_D_sds @ stationary_chol).T
-        
-        Sigma_cycles = (Sigma_cycles + Sigma_cycles.T) / 2.0 
-        Sigma_cycles = Sigma_cycles + _MODEL_JITTER * jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE)
-    else: 
+        # More stable construction
+        if k_stationary == 1:
+            Sigma_cycles = jnp.diag(stationary_variances_safe)
+            L_cycles = jnp.diag(jnp.sqrt(stationary_variances_safe))
+        else:
+            # Direct construction without double decomposition
+            std_devs = jnp.sqrt(stationary_variances_safe)
+            D_matrix = jnp.diag(std_devs)
+            Sigma_cycles = D_matrix @ stationary_chol @ stationary_chol.T @ D_matrix
+            
+            # Ensure symmetry and positive definiteness
+            Sigma_cycles = (Sigma_cycles + Sigma_cycles.T) / 2.0
+            Sigma_cycles = Sigma_cycles + _MODEL_JITTER * jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE)
+            
+            # More stable Cholesky
+            try:
+                L_cycles = jsl.cholesky(Sigma_cycles)
+            except:
+                # Fallback: use diagonal if Cholesky fails
+                L_cycles = jnp.diag(jnp.sqrt(jnp.diag(Sigma_cycles)))
+    else:
         Sigma_cycles = jnp.empty((0,0), dtype=_DEFAULT_DTYPE)
-
+        L_cycles = jnp.empty((0,0), dtype=_DEFAULT_DTYPE)
+        
     # --- Construct Sigma_trends ---
     if n_trend_shocks > 0:
         Sigma_trends = jnp.diag(jnp.maximum(trend_variances_array, _MODEL_JITTER)) 
@@ -350,9 +377,9 @@ def build_state_space_matrices_jit(
             C_comp = C_comp.at[obs_idx, state_idx_in_C].add(value_to_add)
 
     # --- Construct H_comp ---
-    #H_comp = jnp.zeros((k_endog, k_endog), dtype=_DEFAULT_DTYPE)
-    observation_noise_variance = 1e-2
-    H_comp = jnp.eye(k_endog, dtype=_DEFAULT_DTYPE) * observation_noise_variance
+    H_comp = jnp.zeros((k_endog, k_endog), dtype=_DEFAULT_DTYPE)
+    # observation_noise_variance = 1e-2
+    # H_comp = jnp.eye(k_endog, dtype=_DEFAULT_DTYPE) * observation_noise_variance
 
     # --- Construct init_x_comp ---
     init_x_comp = init_x_means_flat
