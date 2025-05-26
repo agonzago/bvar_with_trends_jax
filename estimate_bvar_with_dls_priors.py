@@ -1,5 +1,6 @@
-# estimate_bvar_with_dls_priors_fixed.py
-# Comprehensive fix for I(2) simulation, parameter mapping, and Canova DLS
+# estimate_bvar_with_dls_priors_fixed_online_smoother.py
+# Comprehensive fix for I(2) simulation, parameter mapping, Canova DLS,
+# AND Online Simulation Smoother for memory efficiency.
 
 import jax
 import jax.numpy as jnp
@@ -13,31 +14,62 @@ import numpy as np
 import time
 import os
 import yaml
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Union
 from scipy import linalg
 from scipy.optimize import minimize_scalar
 
 # Configure JAX
 jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_platform_name", "cpu")
+# Keep JAX platform flexible, but for pure Python loops calling JIT, CPU can be simpler initially.
+# jax.config.update("jax_platform_name", "cpu")
 _DEFAULT_DTYPE = jnp.float64
 
+# *** Refined device count setting ***
 try:
     import multiprocessing
-    num_cpu = multiprocessing.cpu_count()
-    numpyro.set_host_device_count(min(num_cpu, 4))
+    # Attempt to get physical CPU count or logical if physical is not available
+    num_cpu = multiprocessing.cpu_count() 
+    # Set host device count, ensuring it's at least 1 and not excessively large
+    numpyro.set_host_device_count(min(num_cpu, 8)) # Cap at 8 for safety/common hardware
 except Exception as e:
-    print(f"Could not set host device count: {e}")
+    print(f"Could not set host device count: {e}. Falling back to default (likely 1 or 4).")
+    # If setting fails, numpyro will use its default, which is usually okay.
     pass
+
 
 # Import your existing modules
 from utils.stationary_prior_jax_simplified import create_companion_matrix_jax
-from core.simulate_bvar_jax import simulate_bvar_with_trends_jax
-from core.var_ss_model import numpyro_bvar_stationary_model, parse_initial_state_config, _parse_equation_jax, _get_off_diagonal_indices
-from core.run_single_draw import run_simulation_smoother_single_params_jit
-from core.parameter_extraction_for_smoother import extract_smoother_parameters, validate_smoother_parameters
-# --- Enhanced DLS Implementation following Canova (2014) ---
+# from core.simulate_bvar_jax import simulate_bvar_with_trends_jax # This is the function being called now
+from core.var_ss_model import (
+    numpyro_bvar_stationary_model, 
+    parse_initial_state_config, 
+    _parse_equation_jax, 
+    _get_off_diagonal_indices,
+    load_config_and_prepare_jax_static_args, 
+    build_state_space_matrices_jit 
+)
+# from core.run_single_draw import run_simulation_smoother_single_params_jit # Replaced by new online logic
+# from core.parameter_extraction_for_smoother import extract_smoother_parameters, validate_smoother_parameters # Not strictly needed now
+# Need KalmanFilter for initial smoothing of original data
+from utils.Kalman_filter_jax import KalmanFilter
+# Need HybridDKSimulationSmoother for its internal filter/smoother used in simulation path
+from utils.hybrid_dk_smoother import HybridDKSimulationSmoother
 
+# Import the new smoother utilities
+from core.smoother_utils import (
+    extract_smoother_parameters_single_draw,
+    construct_ss_matrices_from_smoother_params,
+    OnlineQuantileEstimator, # Although we use its static methods
+    run_single_simulation_path_for_dk,
+    jit_run_single_simulation_path_for_dk_wrapper # Need this for JIT compilation
+)
+
+# *** Import the convert_to_hashable function from utils.jax_utils ***
+from utils.jax_utils import convert_to_hashable
+
+
+# --- Enhanced DLS Implementation following Canova (2014) ---
+# *** RESTORED ***
 class CanovaDLS:
     """
     Canova (2014) Dynamic Linear Smoothing implementation.
@@ -190,8 +222,163 @@ class CanovaDLS:
                 cycle = y_clean - trend
                 return trend, cycle, optimal_lambda, 1e-6, 1e-6
 
-# --- I(2) Data Simulation for BVAR Estimation ---
+# *** RESTORED ***
+def suggest_ig_priors(empirical_var: float, alpha: float = 2.5) -> Dict[str, float]:
+    """Inverse Gamma prior suggestion with safety checks and reasonable minimum variance."""
+    if alpha <= 1:
+        alpha = 2.5
+    
+    # Ensure minimum empirical variance to avoid overly tight priors
+    min_empirical_var = 1e-6
+    empirical_var = max(float(empirical_var), min_empirical_var)
+    
+    beta = empirical_var * (alpha - 1.0)
+    beta = max(float(beta), 1e-9)
+    
+    implied_mean = float(beta / (alpha - 1.0)) if alpha > 1 else float('inf')
+    implied_variance = float(beta**2 / ((alpha - 1.0)**2 * (alpha - 2.0))) if alpha > 2 else float('inf')
+    
+    # Double-check that implied mean is reasonable
+    if implied_mean < min_empirical_var:
+        print(f"Warning: IG prior implies very small mean ({implied_mean:.2e}). Adjusting beta.")
+        beta = min_empirical_var * (alpha - 1.0)
+        implied_mean = float(beta / (alpha - 1.0))
+        implied_variance = float(beta**2 / ((alpha - 1.0)**2 * (alpha - 2.0))) if alpha > 2 else float('inf')
+    
+    return {
+        'alpha': float(alpha),
+        'beta': float(beta),
+        'implied_mean': implied_mean,
+        'implied_variance': implied_variance
+    }
 
+# *** RESTORED function definition (calls the DLS logic above) ***
+def create_config_with_canova_dls(data: pd.DataFrame,
+                                 variable_names: Optional[List[str]] = None,
+                                 training_fraction: float = 0.3,
+                                 var_order: int = 1,
+                                 dls_params: Optional[Dict] = None) -> Dict[str, Any]:
+    """
+    Create BVAR configuration using Canova DLS priors.
+    Uses the enhanced load_config_and_prepare_jax_static_args internally.
+    """
+    if variable_names is None:
+        variable_names = list(data.columns)
+    
+    print("="*80)
+    print("APPLYING CANOVA (2014) DLS PRIOR ELICITATION")
+    print("="*80)
+    
+    # Apply Canova DLS
+    # This calls the DLS logic defined above
+    prior_results = create_config_with_canova_dls( 
+        data=data[variable_names],
+        variable_names=variable_names,
+        training_fraction=training_fraction,
+        dls_params=dls_params
+    )
+    
+    # Create a temporary structure similar to what load_config_and_prepare_jax_static_args expects
+    # for the DLS results to be integrated.
+    temp_config_structure = {
+        'var_order': var_order,
+        'variables': {
+            'observables': variable_names,
+            'trends': [f'trend_{name}' for name in variable_names],
+            'stationary': [f'cycle_{name}' for name in variable_names],
+        },
+        'model_equations': {name: f'trend_{name} + cycle_{name}' for name in variable_names},
+        'initial_conditions': {'states': {}},
+        'stationary_prior': {
+            'hyperparameters': {'es': [0.7, 0.15], 'fs': [0.2, 0.15]},
+            'covariance_prior': {'eta': 1.5},
+            'stationary_shocks': {}
+        },
+        'trend_shocks': {'trend_shocks': {}},
+        'parameters': {'measurement': []}, # Assuming no measurement parameters defined via DLS
+    }
+    
+    # Integrate DLS results into the temporary structure
+    for var_name in variable_names:
+        if var_name in prior_results:
+            result = prior_results[var_name]
+            init_conds = result['initial_conditions']
+            
+            temp_config_structure['initial_conditions']['states'][f'trend_{var_name}'] = {
+                'mean': float(init_conds['trend_mean']),
+                'var': float(init_conds['trend_variance'])
+            }
+            temp_config_structure['initial_conditions']['states'][f'cycle_{var_name}'] = {
+                'mean': float(init_conds['cycle_mean']),
+                'var': float(init_conds['cycle_variance']),
+            }
+            
+            cycle_prior = result['cycle_shocks']
+            temp_config_structure['stationary_prior']['stationary_shocks'][f'cycle_{var_name}'] = {
+                'distribution': 'inverse_gamma',
+                'parameters': {
+                    'alpha': float(cycle_prior['alpha']),
+                    'beta': float(cycle_prior['beta']),
+                }
+            }
+            
+            trend_prior = result['trend_shocks']
+            temp_config_structure['trend_shocks']['trend_shocks'][f'trend_{var_name}'] = {
+                'distribution': 'inverse_gamma',
+                'parameters': {
+                    'alpha': float(trend_prior['alpha']),
+                    'beta': float(trend_prior['beta']),
+                }
+            }
+        else:
+            print(f"Warning: No Canova DLS results for {var_name}. Using defaults.")
+            # Set some reasonable defaults if DLS failed for a variable
+            temp_config_structure['initial_conditions']['states'][f'trend_{var_name}'] = {
+                'mean': float(data[var_name].iloc[0]) if len(data) > 0 and np.isfinite(data[var_name].iloc[0]) else 0.0, 
+                'var': 1.0
+            }
+            temp_config_structure['initial_conditions']['states'][f'cycle_{var_name}'] = {
+                'mean': 0.0, 
+                'var': 1.0
+            }
+             # Set some default shock priors if DLS failed
+            temp_config_structure['stationary_prior']['stationary_shocks'][f'cycle_{var_name}'] = {
+                'distribution': 'inverse_gamma', 'parameters': {'alpha': 2.0, 'beta': 1.0}
+            }
+            temp_config_structure['trend_shocks']['trend_shocks'][f'trend_{var_name}'] = {
+                 'distribution': 'inverse_gamma', 'parameters': {'alpha': 2.0, 'beta': 1.0}
+             }
+
+
+    # Now, use load_config_and_prepare_jax_static_args to fully parse this structure
+    # We need to save this temporary structure to a file and then load it.
+    # This is a bit clunky, but load_config_and_prepare_jax_static_args is designed
+    # to read from a file path.
+    temp_config_path = "temp_dls_config.yml"
+    try:
+        with open(temp_config_path, 'w') as f:
+            yaml.dump(temp_config_structure, f, default_flow_style=False, sort_keys=False)
+        
+        # Load and parse the temporary config
+        config_data = load_config_and_prepare_jax_static_args(temp_config_path)
+        
+        # Add the raw DLS results diagnostics for plotting/reporting
+        config_data['canova_dls_results'] = prior_results
+
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(temp_config_path):
+            os.remove(temp_config_path)
+
+    print("="*80)
+    print("CANOVA DLS PRIOR ELICITATION AND CONFIG PARSING COMPLETED")
+    print("="*80)
+    
+    return config_data
+
+
+# --- I(2) Data Simulation for BVAR Estimation ---
+# *** RESTORED function definition ***
 def simulate_i2_economic_data(dates: pd.DatetimeIndex, 
                              variables: List[str],
                              seed: int = 42) -> pd.DataFrame:
@@ -203,7 +390,7 @@ def simulate_i2_economic_data(dates: pd.DatetimeIndex,
         variables: List of variable names
         seed: Random seed
         
-    Returns:
+        Returns:
         DataFrame with I(2) level data and corresponding growth rates
     """
     np.random.seed(seed)
@@ -266,7 +453,14 @@ def simulate_i2_economic_data(dates: pd.DatetimeIndex,
         
     return df
 
-# --- Fixed Parameter Mapping for Smoother ---
+
+# --- Parameter Mapping for Smoother (Keep this section as is) ---
+# NOTE: This function is used to map MCMC output *names* to smoother *names*,
+# not to structure the parameters for the new online smoother logic.
+# The online smoother extracts matrices directly from deterministic sites.
+# This function might still be useful for debugging or if you need
+# posterior means of parameters *before* they are used to build matrices.
+# Let's keep it but be mindful of its role.
 
 def extract_posterior_params_for_smoother(posterior_samples: Dict, 
                                         config_data: Dict,
@@ -359,376 +553,6 @@ def extract_posterior_params_for_smoother(posterior_samples: Dict,
     
     return posterior_mean_params
 
-# --- Enhanced DLS Prior Elicitation ---
-
-def create_dls_config_with_canova(data: pd.DataFrame,
-                                 variable_names: List[str],
-                                 training_fraction: float = 0.3,
-                                 dls_params: Optional[Dict] = None) -> Dict[str, Any]:
-    """
-    Apply Canova (2014) DLS to training data for prior elicitation.
-    """
-    
-    # Default DLS parameters
-    default_dls_params = {
-        'optimize_smoothness': True,
-        'smoothness_range': (1e-6, 1e2),
-        'alpha_shape': 2.5,
-    }
-    actual_dls_params = {**default_dls_params, **(dls_params or {})}
-    
-    # Use subset of data for prior elicitation
-    n_total = len(data)
-    n_train = max(int(training_fraction * n_total), 20)  # Minimum 20 observations
-    train_data = data.iloc[:n_train]
-    
-    print(f"Using {len(train_data)} observations for Canova DLS prior elicitation")
-    
-    # Initialize Canova DLS
-    dls_extractor = CanovaDLS(
-        smoothness_range=actual_dls_params['smoothness_range'],
-        optimize_smoothness=actual_dls_params['optimize_smoothness']
-    )
-    
-    dls_results = {}
-    
-    for var_name in variable_names:
-        y = train_data[var_name].values.astype(_DEFAULT_DTYPE)
-        
-        # Need at least some finite observations
-        if np.sum(np.isfinite(y)) < 10:
-            print(f"Warning: Too few finite observations for {var_name}. Using defaults.")
-            continue
-        
-        try:
-            # Apply Canova DLS
-            trend, cycle, optimal_lambda, trend_var, cycle_var = dls_extractor.extract_trend_cycle(y)
-            
-            # Compute initial conditions from early observations
-            initial_window = min(10, np.sum(np.isfinite(y)))
-            early_trend = trend[:initial_window]
-            early_cycle = cycle[:initial_window]
-            
-            early_trend_valid = early_trend[np.isfinite(early_trend)]
-            early_cycle_valid = early_cycle[np.isfinite(early_cycle)]
-            
-            initial_trend_mean = np.mean(early_trend_valid) if len(early_trend_valid) > 0 else 0.0
-            initial_cycle_mean = np.mean(early_cycle_valid) if len(early_cycle_valid) > 0 else 0.0
-            
-            initial_trend_var = np.var(early_trend_valid) if len(early_trend_valid) > 1 else trend_var * 5.0
-            initial_cycle_var = np.var(early_cycle_valid) if len(early_cycle_valid) > 1 else cycle_var
-            
-            # Ensure positive variances
-            initial_trend_var = max(float(initial_trend_var), 1e-9)
-            initial_cycle_var = max(float(initial_cycle_var), 1e-9)
-            
-            # Create prior suggestions
-            trend_prior = suggest_ig_priors(trend_var, alpha=actual_dls_params['alpha_shape'])
-            cycle_prior = suggest_ig_priors(cycle_var, alpha=actual_dls_params['alpha_shape'])
-            
-            dls_results[var_name] = {
-                'initial_conditions': {
-                    'trend_mean': float(initial_trend_mean),
-                    'trend_variance': float(initial_trend_var),
-                    'cycle_mean': float(initial_cycle_mean), 
-                    'cycle_variance': float(initial_cycle_var),
-                },
-                'trend_shocks': trend_prior,
-                'cycle_shocks': cycle_prior,
-                'diagnostics': {
-                    'trend_component': trend,
-                    'cycle_component': cycle,
-                    'optimal_lambda': optimal_lambda,
-                    'extracted_trend_var': trend_var,
-                    'extracted_cycle_var': cycle_var
-                }
-            }
-            
-            print(f"Canova DLS for {var_name}:")
-            print(f"  Optimal λ: {optimal_lambda:.6f}")
-            print(f"  Trend shock var: {trend_var:.6f} -> IG(α={trend_prior['alpha']:.2f}, β={trend_prior['beta']:.6f})")
-            print(f"  Cycle shock var: {cycle_var:.6f} -> IG(α={cycle_prior['alpha']:.2f}, β={cycle_prior['beta']:.6f})")
-            
-        except Exception as e:
-            print(f"Error during Canova DLS for {var_name}: {e}")
-            continue
-    
-    return dls_results
-
-def suggest_ig_priors(empirical_var: float, alpha: float = 2.5) -> Dict[str, float]:
-    """Inverse Gamma prior suggestion with safety checks and reasonable minimum variance."""
-    if alpha <= 1:
-        alpha = 2.5
-    
-    # Ensure minimum empirical variance to avoid overly tight priors
-    min_empirical_var = 1e-6
-    empirical_var = max(float(empirical_var), min_empirical_var)
-    
-    beta = empirical_var * (alpha - 1.0)
-    beta = max(float(beta), 1e-9)
-    
-    implied_mean = float(beta / (alpha - 1.0)) if alpha > 1 else float('inf')
-    implied_variance = float(beta**2 / ((alpha - 1.0)**2 * (alpha - 2.0))) if alpha > 2 else float('inf')
-    
-    # Double-check that implied mean is reasonable
-    if implied_mean < min_empirical_var:
-        print(f"Warning: IG prior implies very small mean ({implied_mean:.2e}). Adjusting beta.")
-        beta = min_empirical_var * (alpha - 1.0)
-        implied_mean = float(beta / (alpha - 1.0))
-        implied_variance = float(beta**2 / ((alpha - 1.0)**2 * (alpha - 2.0))) if alpha > 2 else float('inf')
-    
-    return {
-        'alpha': float(alpha),
-        'beta': float(beta),
-        'implied_mean': implied_mean,
-        'implied_variance': implied_variance
-    }
-
-# --- Rest of the estimation pipeline (convert_to_hashable, etc.) ---
-
-def convert_to_hashable(obj):
-    """Recursively convert lists to tuples to make objects hashable for JAX JIT."""
-    if isinstance(obj, list):
-        return tuple(convert_to_hashable(item) for item in obj)
-    elif isinstance(obj, tuple):
-        return tuple(convert_to_hashable(item) for item in obj)
-    elif isinstance(obj, dict):
-        return tuple(sorted(((str(k), convert_to_hashable(v)) if not isinstance(k, str) else (k, convert_to_hashable(v))) for k, v in obj.items()))
-    elif isinstance(obj, np.ndarray):
-        if obj.ndim == 0:  # Scalar numpy array
-            return float(obj.item())
-        else:
-            return tuple(obj.tolist())
-    elif isinstance(obj, jnp.ndarray):
-        if obj.ndim == 0:  # Scalar JAX array  
-            return float(obj.item())
-        else:
-            return tuple(obj.tolist())
-    elif hasattr(obj, 'item') and callable(getattr(obj, 'item')):  # JAX/numpy scalar
-        return float(obj.item())
-    else:
-        return obj
-
-def create_config_with_canova_dls(data: pd.DataFrame,
-                                 variable_names: Optional[List[str]] = None,
-                                 training_fraction: float = 0.3,
-                                 var_order: int = 1,
-                                 dls_params: Optional[Dict] = None) -> Dict[str, Any]:
-    """
-    Create BVAR configuration using Canova DLS priors.
-    """
-    if variable_names is None:
-        variable_names = list(data.columns)
-    
-    print("="*80)
-    print("APPLYING CANOVA (2014) DLS PRIOR ELICITATION")
-    print("="*80)
-    
-    # Apply Canova DLS
-    prior_results = create_dls_config_with_canova(
-        data=data[variable_names],
-        variable_names=variable_names,
-        training_fraction=training_fraction,
-        dls_params=dls_params
-    )
-    
-    # Create configuration structure (same as before, just using Canova results)
-    config_data = {
-        'var_order': var_order,
-        'variables': {
-            'observable_names': variable_names,
-            'trend_names': [f'trend_{name}' for name in variable_names],
-            'stationary_var_names': [f'cycle_{name}' for name in variable_names],
-        },
-        'model_equations': {},
-        'initial_conditions': {'states': {}},
-        'stationary_prior': {
-            'hyperparameters': {'es': [0.7, 0.15], 'fs': [0.2, 0.15]},
-            'covariance_prior': {'eta': 1.5},
-            'stationary_shocks': {}
-        },
-        'trend_shocks': {'trend_shocks': {}},
-        'parameters': {'measurement': []},
-    }
-    
-    # Calculate dimensions
-    k_endog = len(variable_names)
-    k_trends = len(variable_names)
-    k_stationary = len(variable_names)
-    k_states = k_trends + k_stationary * var_order
-    
-    config_data.update({
-        'k_endog': k_endog,
-        'k_trends': k_trends,
-        'k_stationary': k_stationary,
-        'k_states': k_states,
-    })
-    
-    # Fill in model equations
-    for var_name in variable_names:
-        config_data['model_equations'][var_name] = f'trend_{var_name} + cycle_{var_name}'
-    
-    # Fill in Canova DLS priors
-    for var_name in variable_names:
-        if var_name in prior_results:
-            result = prior_results[var_name]
-            init_conds = result['initial_conditions']
-            
-            # Initial conditions
-            config_data['initial_conditions']['states'][f'trend_{var_name}'] = {
-                'mean': float(init_conds['trend_mean']),
-                'var': float(init_conds['trend_variance'])
-            }
-            config_data['initial_conditions']['states'][f'cycle_{var_name}'] = {
-                'mean': float(init_conds['cycle_mean']),
-                'var': float(init_conds['cycle_variance'])
-            }
-            
-            # Cycle shock priors
-            cycle_prior = result['cycle_shocks']
-            config_data['stationary_prior']['stationary_shocks'][f'cycle_{var_name}'] = {
-                'distribution': 'inverse_gamma',
-                'parameters': {
-                    'alpha': float(cycle_prior['alpha']),
-                    'beta': float(cycle_prior['beta'])
-                }
-            }
-            
-            # Trend shock priors
-            trend_prior = result['trend_shocks']
-            config_data['trend_shocks']['trend_shocks'][f'trend_{var_name}'] = {
-                'distribution': 'inverse_gamma',
-                'parameters': {
-                    'alpha': float(trend_prior['alpha']),
-                    'beta': float(trend_prior['beta'])
-                }
-            }
-        else:
-            print(f"Warning: No Canova DLS results for {var_name}. Using defaults.")
-            # Set defaults
-            config_data['initial_conditions']['states'][f'trend_{var_name}'] = {
-                'mean': float(data[var_name].iloc[0]) if len(data) > 0 and np.isfinite(data[var_name].iloc[0]) else 0.0, 
-                'var': 1.0
-            }
-            config_data['initial_conditions']['states'][f'cycle_{var_name}'] = {
-                'mean': 0.0, 
-                'var': 1.0
-            }
-    
-    # Parse configuration (rest of the parsing logic remains the same)
-    config_data['initial_conditions_parsed'] = parse_initial_state_config(config_data['initial_conditions'])
-    
-    # Parse model equations
-    measurement_params_config = config_data.get('parameters', {}).get('measurement', [])
-    measurement_param_names = [p['name'] for p in measurement_params_config if isinstance(p, dict) and 'name' in p]
-    
-    parsed_model_eqs_list = []
-    observable_indices = {name: i for i, name in enumerate(variable_names)}
-    
-    trend_names = config_data['variables']['trend_names']
-    stationary_names = config_data['variables']['stationary_var_names']
-    
-    for obs_name, eq_str in config_data['model_equations'].items():
-        if obs_name in observable_indices:
-            parsed_terms = _parse_equation_jax(eq_str, trend_names, stationary_names, measurement_param_names)
-            parsed_model_eqs_list.append((observable_indices[obs_name], parsed_terms))
-    
-    config_data['model_equations_parsed'] = parsed_model_eqs_list
-    
-    # Create detailed parsing for JAX
-    full_state_names_list_for_parsing = list(trend_names)
-    for i in range(var_order):
-        for stat_var in stationary_names:
-            if i == 0:
-                full_state_names_list_for_parsing.append(stat_var)
-            else:
-                full_state_names_list_for_parsing.append(f"{stat_var}_t_minus_{i+1}")
-    
-    c_matrix_state_names = full_state_names_list_for_parsing
-    state_to_c_idx_map = {name: i for i, name in enumerate(c_matrix_state_names)}
-    param_to_idx_map = {name: i for i, name in enumerate(measurement_param_names)}
-    
-    parsed_model_eqs_jax_detailed = []
-    for obs_idx, parsed_terms in parsed_model_eqs_list:
-        processed_terms_for_obs = []
-        for param_name, state_name_in_eq, sign in parsed_terms:
-            term_type = 0 if param_name is None else 1
-            if state_name_in_eq in state_to_c_idx_map:
-                state_index_in_C = state_to_c_idx_map[state_name_in_eq]
-                param_index_if_any = param_to_idx_map.get(param_name, -1)
-                processed_terms_for_obs.append(
-                    (term_type, state_index_in_C, param_index_if_any, float(sign))
-                )
-        parsed_model_eqs_jax_detailed.append((obs_idx, tuple(processed_terms_for_obs)))
-    
-    config_data['parsed_model_eqs_jax_detailed'] = tuple(parsed_model_eqs_jax_detailed)
-    
-    # Identify trend names with shocks
-    trend_shocks_spec = config_data.get('trend_shocks', {}).get('trend_shocks', {})
-    config_data['trend_names_with_shocks'] = [
-        name for name in config_data['variables']['trend_names']
-        if name in trend_shocks_spec and isinstance(trend_shocks_spec[name], dict) and trend_shocks_spec[name].get('distribution') == 'inverse_gamma'
-    ]
-    config_data['n_trend_shocks'] = len(config_data['trend_names_with_shocks'])
-    
-    # Pre-calculate static indices
-    off_diag_rows, off_diag_cols = _get_off_diagonal_indices(k_stationary)
-    config_data['static_off_diag_indices'] = (off_diag_rows.astype(int), off_diag_cols.astype(int))
-    config_data['num_off_diag'] = k_stationary * (k_stationary - 1)
-    
-    # Add compatibility keys
-    config_data.update({
-        'observable_names': tuple(variable_names),
-        'trend_var_names': tuple(config_data['variables']['trend_names']),
-        'stationary_var_names': tuple(config_data['variables']['stationary_var_names']),
-        'raw_config_initial_conds': config_data['initial_conditions'],
-        'raw_config_stationary_prior': config_data['stationary_prior'],
-        'raw_config_trend_shocks': config_data['trend_shocks'],
-        'raw_config_measurement_params': measurement_params_config,
-        'raw_config_model_eqs_str_dict': config_data['model_equations'],
-        'measurement_param_names_tuple': tuple(measurement_param_names),
-    })
-    
-    # Create flat initial condition arrays
-    config_data['full_state_names_tuple'] = tuple(full_state_names_list_for_parsing)
-    
-    init_x_means_flat_list = []
-    init_P_diag_flat_list = []
-    initial_conditions_parsed = config_data['initial_conditions_parsed']
-    
-    for state_name in full_state_names_list_for_parsing:
-        base_name_for_lag = state_name
-        is_lagged = False
-        if "_t_minus_" in state_name:
-            parts = state_name.split("_t_minus_")
-            if len(parts) == 2:
-                base_name_for_lag = parts[0]
-                is_lagged = True
-        
-        if state_name in initial_conditions_parsed:
-            init_x_means_flat_list.append(float(initial_conditions_parsed[state_name]['mean']))
-            init_P_diag_flat_list.append(float(initial_conditions_parsed[state_name]['var']))
-        elif is_lagged and base_name_for_lag in initial_conditions_parsed:
-            init_x_means_flat_list.append(float(initial_conditions_parsed[base_name_for_lag]['mean']))
-            init_P_diag_flat_list.append(float(initial_conditions_parsed[base_name_for_lag]['var']))
-        else:
-            print(f"Warning: Initial condition not found for state '{state_name}'. Using defaults.")
-            init_x_means_flat_list.append(0.0)
-            init_P_diag_flat_list.append(1.0)
-    
-    config_data['init_x_means_flat'] = jnp.array(init_x_means_flat_list, dtype=_DEFAULT_DTYPE)
-    config_data['init_P_diag_flat'] = jnp.array(init_P_diag_flat_list, dtype=_DEFAULT_DTYPE)
-    
-    # Store Canova DLS results
-    config_data['canova_dls_results'] = prior_results
-    
-    print("="*80)
-    print("CANOVA DLS PRIOR ELICITATION COMPLETED")
-    print("="*80)
-    
-    return config_data
-
-# --- Main Estimation Function with All Fixes ---
 
 def run_bvar_estimation_with_fixes(data: pd.DataFrame,
                                   variable_names: Optional[List[str]] = None,
@@ -736,14 +560,16 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
                                   var_order: int = 1,
                                   mcmc_params: Optional[Dict] = None,
                                   dls_params: Optional[Dict] = None,
-                                  simulation_draws: int = 100,
+                                  simulation_draws_per_mcmc: int = 100, # Number of smoother draws per MCMC sample
+                                  online_smoother_buffer_size: int = 1000, # Buffer size for online quantiles
                                   save_config: bool = True,
                                   config_filename: str = "bvar_canova_dls.yml") -> Dict[str, Any]:
     """
     Complete BVAR estimation with all fixes:
     1. I(2) data simulation with proper differencing
     2. Canova (2014) DLS prior elicitation  
-    3. Fixed parameter mapping for smoother
+    3. Fixed parameter mapping for smoother (implicit via deterministic sites)
+    4. Online Simulation Smoother for memory efficiency.
     """
     
     if variable_names is None:
@@ -755,6 +581,19 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
             'num_samples': 500,
             'num_chains': 2
         }
+
+    # Initialize results dictionary early to ensure data_info is always included
+    results = {
+        'config': None, # Will be filled later
+        'mcmc_results': None,
+        'smoothing_results': None,
+        'data_info': {
+            'data_shape': data[variable_names].values.shape,
+            'variable_names': variable_names,
+            'date_range': (data.index[0], data.index[-1])
+        },
+        'error': None # Initialize error field
+    }
     
     print("="*100)
     print("BVAR ESTIMATION WITH CANOVA DLS AND I(2) DATA HANDLING")
@@ -764,223 +603,414 @@ def run_bvar_estimation_with_fixes(data: pd.DataFrame,
     print(f"VAR order: {var_order}")
     print(f"Training fraction: {training_fraction:.1%}")
     
-    # Step 1: Create configuration with Canova DLS priors
-    print("\nStep 1: Generating Canova DLS priors...")
-    config_data = create_config_with_canova_dls(
-        data=data,
-        variable_names=variable_names,
-        training_fraction=training_fraction,
-        var_order=var_order,
-        dls_params=dls_params
-    )
-    
-    # Step 2: Save configuration if requested
+    # Step 1: Create configuration with Canova DLS priors and parse it
+    print("\nStep 1: Generating Canova DLS priors and parsing config...")
+    try:
+        # create_config_with_canova_dls calls create_dls_config_with_canova internally
+        config_data = create_config_with_canova_dls( 
+            data=data,
+            variable_names=variable_names,
+            training_fraction=training_fraction,
+            var_order=var_order,
+            dls_params=dls_params
+        )
+        results['config'] = config_data # Store config in results
+    except Exception as e:
+         print(f"\nERROR: Configuration generation failed: {e}")
+         results['error'] = f"Config generation failed: {e}"
+         import traceback
+         traceback.print_exc()
+         return results # Exit early if config fails
+
+
+    # Step 2: Save configuration if requested (save the *generated* structure)
     if save_config:
-        yaml_config = {
+        # Reconstruct a savable YAML structure from the parsed config_data
+        yaml_config_to_save = {
             'var_order': config_data['var_order'],
             'variables': {
-                'observables': list(config_data['variables']['observable_names']),
-                'trends': list(config_data['variables']['trend_names']),
-                'stationary': list(config_data['variables']['stationary_var_names'])
+                'observables': list(config_data['observable_names']),
+                'trends': list(config_data['trend_var_names']),
+                'stationary': list(config_data['stationary_var_names'])
             },
-            'model_equations': config_data['model_equations'],
-            'initial_conditions': config_data['raw_config_initial_conds'],
-            'stationary_prior': config_data['raw_config_stationary_prior'],
-            'trend_shocks': config_data['raw_config_trend_shocks'],
-            'parameters': config_data['raw_config_measurement_params']
+            'model_equations': config_data['raw_config_model_eqs_str_dict'],
+            # Use the original initial conditions structure if available, otherwise the parsed one
+            'initial_conditions': config_data.get('raw_config_initial_conds', {}),
+            'stationary_prior': config_data.get('raw_config_stationary_prior', {}),
+            'trend_shocks': config_data.get('raw_config_trend_shocks', {}),
+            'parameters': config_data.get('raw_config_measurement_params', []),
         }
         
         try:
             with open(config_filename, 'w') as f:
-                yaml.dump(yaml_config, f, default_flow_style=False, sort_keys=False)
+                yaml.dump(yaml_config_to_save, f, default_flow_style=False, sort_keys=False)
             print(f"Configuration saved to: {config_filename}")
         except Exception as e:
             print(f"Warning: Could not save configuration: {e}")
     
     # Step 3: Prepare data for estimation
     y_data = data[variable_names].values.astype(_DEFAULT_DTYPE)
+    T_obs = y_data.shape[0]
+    k_endog = config_data['k_endog']
+    k_states = config_data['k_states'] # Total state dimension
+    
     print(f"\nStep 3: Preparing data...")
     print(f"Data shape: {y_data.shape}")
     
-    # Handle observations
-    valid_obs_mask_cols = jnp.any(jnp.isfinite(y_data), axis=0)
+    # Handle observations (for initial filter on original data and within MCMC)
+    valid_obs_mask_cols = jnp.any(jnp.isfinite(y_data), axis=0) # Check for columns with *any* finite data
     static_valid_obs_idx = jnp.where(valid_obs_mask_cols)[0]
     static_n_obs_actual = static_valid_obs_idx.shape[0]
     
     if static_n_obs_actual == 0:
+        results['error'] = "No valid observation columns found."
         raise ValueError("No valid observation columns found.")
-    
+
     # Step 4: Run MCMC estimation
     print(f"\nStep 4: Running MCMC estimation...")
+    
+    # Pass lists/tuples from config_data directly, matching model signature
     model_args = {
         'y': y_data,
-        'config_data': config_data,
+        'config_data': config_data, # Pass the parsed config_data
         'static_valid_obs_idx': static_valid_obs_idx,
         'static_n_obs_actual': static_n_obs_actual,
-        'trend_var_names': list(config_data['variables']['trend_names']),
-        'stationary_var_names': list(config_data['variables']['stationary_var_names']),
-        'observable_names': list(config_data['variables']['observable_names']),
+        'trend_var_names': config_data['trend_var_names'], # Use tuple from config_data
+        'stationary_var_names': config_data['stationary_var_names'], # Use tuple from config_data
+        'observable_names': config_data['observable_names'], # Use tuple from config_data
     }
     
     kernel = NUTS(model=numpyro_bvar_stationary_model, init_strategy=numpyro.infer.init_to_sample())
-    mcmc = MCMC(kernel, **mcmc_params)
+    mcmc_params_actual = {**{'num_warmup': 300, 'num_samples': 500, 'num_chains': 2}, **(mcmc_params or {})}
+    mcmc = MCMC(kernel, **mcmc_params_actual)
     
     key = random.PRNGKey(42)
-    key_mcmc, key_smooth = random.split(key)
-    
+    key_mcmc, key_smoother_global = random.split(key) # Split global key for smoother draws
+
     start_time = time.time()
     try:
         mcmc.run(key_mcmc, **model_args)
         mcmc_time = time.time() - start_time
         print(f"\nMCMC completed in {mcmc_time:.2f} seconds")
-        mcmc.print_summary()
+        # mcmc.print_summary() # Summary can be long, optionally print
         posterior_samples = mcmc.get_samples()
         mcmc_extras = mcmc.get_extra_fields()
+        num_mcmc_samples = mcmc_params_actual['num_samples'] * mcmc_params_actual['num_chains']
+        print(f"Extracted {num_mcmc_samples} MCMC samples.")
+        results['mcmc_results'] = {'posterior_samples': posterior_samples, 'mcmc_time': mcmc_time, 'mcmc_summary': mcmc_extras}
     except Exception as e:
         print(f"\nERROR: MCMC estimation failed: {e}")
+        results['error'] = f"MCMC failed: {e}"
         import traceback
         traceback.print_exc()
-        return {
-            'config': config_data,
-            'mcmc_results': None,
-            'smoothing_results': None,
-            'error': f"MCMC failed: {e}"
-        }
+        return results # Exit if MCMC fails
     
-    smoother_params = extract_smoother_parameters(posterior_samples, config_data, variable_names)
-    validate_smoother_parameters(smoother_params)
+    # Step 5: Run standard RTS smoother on original data (using posterior mean parameters)
+    # We need this baseline smoothed path for the Durbin-Koopman formula.
+    print(f"\nStep 5: Running standard RTS smoother on original data (posterior mean)...")
     
-    # Step 5: Extract parameters with fixed mapping for smoother
-    print(f"\nStep 5: Extracting parameters for smoother...")
+    try:
+        # Extract posterior mean of relevant parameters needed to build the mean SS model
+        # This needs to match the parameters build_state_space_matrices_jit takes.
+        posterior_mean_params_for_rts_builder = {}
+        
+        # Collect names of parameters expected by build_state_space_matrices_jit's params_dict
+        params_expected_by_builder = ['A_diag']
+        if config_data['num_off_diag'] > 0: params_expected_by_builder.append('A_offdiag')
+        if config_data['k_stationary'] > 1: params_expected_by_builder.append('stationary_chol')
+        params_expected_by_builder.extend([f'stationary_var_{name}' for name in config_data['stationary_var_names']])
+        params_expected_by_builder.extend([f'trend_var_{name}' for name in config_data['trend_names_with_shocks']])
+        params_expected_by_builder.extend(list(config_data['measurement_param_names_tuple']))
+
+        # Populate posterior_mean_params_for_rts_builder with means from posterior_samples
+        for param_name in params_expected_by_builder:
+            if param_name in posterior_samples:
+                 # Get mean, handle potential non-numeric types if any (shouldn't happen with these params)
+                 mean_val = jnp.mean(jnp.asarray(posterior_samples[param_name], dtype=_DEFAULT_DTYPE), axis=0)
+                 posterior_mean_params_for_rts_builder[param_name] = mean_val
+            else:
+                 # If a parameter expected by the builder is NOT in posterior_samples,
+                 # it means it wasn't sampled (e.g., offdiag when num_off_diag=0).
+                 # build_state_space_matrices_jit needs to handle this gracefully (using .get).
+                 pass # Do nothing, build_state_space_matrices_jit will use default via .get
+
+        # Build state-space matrices using posterior mean parameters
+        ss_matrices_posterior_mean = build_state_space_matrices_jit( # *** This should be imported now ***
+            posterior_mean_params_for_rts_builder, config_data # Pass config_data as static
+        )
+        
+        # Prepare for Kalman filter using matrices from posterior mean
+        # Note: KalmanFilter uses R directly to compute Q=R@R.T internally.
+        # ss_matrices_posterior_mean['R_comp'] IS the Cholesky of Q for the KF likelihood.
+        kf_mean = KalmanFilter(
+            ss_matrices_posterior_mean['T_comp'],
+            ss_matrices_posterior_mean['R_comp'], 
+            ss_matrices_posterior_mean['C_comp'],
+            ss_matrices_posterior_mean['H_comp'],
+            ss_matrices_posterior_mean['init_x_comp'], 
+            ss_matrices_posterior_mean['init_P_comp'] 
+        )
+        
+        # Run filter
+        # The standard KF.filter needs static NaN info, but applied to the DENSE y_data here.
+        # The y_data can still have NaNs if some *variables* are missing entirely across time,
+        # but the filter logic used here (_filter_internal) is simpler and expects dense input
+        # for the *actually observed* columns (selected by static_valid_obs_idx).
+        # However, the base KalmanFilter in Kalman_filter_jax *does* handle time-varying NaNs.
+        # Let's use the filter method from the base KalmanFilter class which handles NaNs.
+        
+        # Prepare static args for KalmanFilter.filter using matrices from posterior mean
+        static_C_obs_mean = ss_matrices_posterior_mean['C_comp'][static_valid_obs_idx, :]
+        static_H_obs_mean = ss_matrices_posterior_mean['H_comp'][static_valid_obs_idx[:, None], static_valid_obs_idx]
+        static_I_obs_mean = jnp.eye(static_n_obs_actual, dtype=_DEFAULT_DTYPE)
+
+        filter_results_original = kf_mean.filter( # Use the filter method from KalmanFilter which handles NaNs
+            y_data, static_valid_obs_idx, static_n_obs_actual, 
+            static_C_obs_mean, static_H_obs_mean, static_I_obs_mean
+        )
+        
+        # Run smoother
+        x_smooth_original_dense, _ = kf_mean.smooth( # Use the smooth method from KalmanFilter which handles NaNs
+            y_data, filter_results_original, static_valid_obs_idx, static_n_obs_actual,
+             static_C_obs_mean, static_H_obs_mean, static_I_obs_mean
+        )
+        print("Standard RTS smoothing on original data (posterior mean) completed.")
+        
+        results['smoothing_results'] = {'smoothed_states_original_mean_rts': x_smooth_original_dense}
+
+    except Exception as e:
+        print(f"\nERROR: Standard RTS smoothing on posterior mean failed: {e}")
+        results['error'] = f"Standard RTS smoothing failed: {e}"
+        import traceback
+        traceback.print_exc()
+        # We can potentially continue to online smoother if the error was only in the RTS mean,
+        # but Durbin-Koopman NEEDS x_smooth_original_dense. So we must exit here if this fails.
+        return results 
+
+
+    # Step 6: Initialize Online Quantile Estimators Grid
+    print(f"\nStep 6: Initializing online quantile estimators ({T_obs} time steps x {k_states} states)...")
     
-    # CRITICAL FIX: Use the corrected parameter extraction function
-    posterior_mean_params = extract_posterior_params_for_smoother(
-        posterior_samples, config_data, variable_names
+    buffer_grid = jnp.full(
+        (T_obs, k_states, online_smoother_buffer_size), 
+        jnp.nan, 
+        dtype=_DEFAULT_DTYPE
     )
+    count_grid = jnp.zeros((T_obs, k_states), dtype=jnp.int32)
     
-    print(f"Extracted parameters: {list(posterior_mean_params.keys())}")
+    quantiles_to_track = [0.025, 0.5, 0.975]
     
-    # Verify we have the required parameters
-    required_base_params = ['A_diag']
-    for var_name in variable_names:
-        required_base_params.extend([
-            f'stationary_var_{var_name}',
-            f'trend_var_{var_name}'
-        ])
+    # Step 7: Main Processing Loop for Online Simulation Smoothing
+    print(f"\nStep 7: Running online simulation smoother ({num_mcmc_samples} MCMC samples x {simulation_draws_per_mcmc} smoother draws)...")
     
-    missing_critical = [p for p in required_base_params if p not in posterior_mean_params]
-    if missing_critical:
-        print(f"ERROR: Missing critical parameters for smoother: {missing_critical}")
-        return {
-            'config': config_data,
-            'mcmc_results': {'posterior_samples': posterior_samples, 'mcmc_time': mcmc_time},
-            'smoothing_results': None,
-            'error': f"Missing parameters: {missing_critical}"
-        }
+    total_simulation_draws = num_mcmc_samples * simulation_draws_per_mcmc
+    processed_draws = 0
+    start_smooth_sim_time = time.time()
     
-    # Step 6: Run simulation smoother with fixed parameters
-    print(f"\nStep 6: Running simulation smoother...")
+    # Generate keys for each simulation draw
+    all_smoother_keys = random.split(key_smoother_global, total_simulation_draws)
+
+    key_idx = 0 # Index for all_smoother_keys
     
-    # Convert to hashable formats with error handling
+    # JIT compile the single simulation path function wrapper once outside the loop
+    # This wrapper takes smoother params, original data, baseline smooth, key, and static config.
+    # The static_argnames must match the static arguments of the wrapper.
+    # The static argument should be the HASHABLE config.
+    
+    # Convert the static config_data to a hashable format
+    hashable_config_data = convert_to_hashable(config_data)
+
+    # Pass the hashable config as the static argument
+    jit_run_single_simulation_path = jax.jit(jit_run_single_simulation_path_for_dk_wrapper, static_argnames=['static_config_data'])
+
+    # Loop through each MCMC sample (Python loop)
+    for mcmc_draw_idx in range(num_mcmc_samples):
+        # Extract parameters for this specific MCMC draw
+        try:
+             # Use the updated extract function
+             # extract_smoother_parameters_single_draw needs posterior_samples, draw_idx, AND config_data
+             smoother_params_single_draw = extract_smoother_parameters_single_draw(
+                posterior_samples, mcmc_draw_idx, config_data 
+             )
+             # smoother_params_single_draw should contain: phi_list, Sigma_cycles, Sigma_trends_full, init_x_comp, init_P_comp, measurement_params
+             # These are the *parameters* that define the SS model for this draw.
+
+        except Exception as e:
+            print(f"\nWarning: Failed to extract smoother parameters for MCMC draw {mcmc_draw_idx}: {e}. Skipping this draw.")
+            results['error'] = f"Parameter extraction failed for MCMC sample {mcmc_draw_idx}: {e}"
+            import traceback
+            traceback.print_exc()
+            key_idx += simulation_draws_per_mcmc # Skip keys for this draw's smoother draws
+            continue # Skip to next MCMC draw
+
+        # Inner loop: Run simulation smoother draws for this MCMC sample (Python loop)
+        for smoother_draw_idx in range(simulation_draws_per_mcmc):
+            current_smoother_key = all_smoother_keys[key_idx]
+            
+            try:
+                # Run a single simulation path for this draw using the JITted wrapper
+                # The wrapper constructs the SS matrices inside the JIT.
+                simulated_states_path = jit_run_single_simulation_path(
+                    smoother_params_single_draw, # Dynamic parameter dictionary for the draw
+                    y_data, # Dynamic original data (full data needed for simulation)
+                    x_smooth_original_dense, # Dynamic baseline smoothed path (from posterior mean)
+                    current_smoother_key, # Dynamic key for simulation noise
+                    static_config_data=hashable_config_data # *** Pass the hashable config as static ***
+                )
+
+                # Update the online quantile estimators (buffers and counts)
+                # Use a JAX scan over time and state dimensions.
+                def update_estimator_grid_step(carry, ts_idx):
+                    buffer_grid_carry, count_grid_carry = carry
+                    t, s = ts_idx # Time step index, State variable index
+                    
+                    new_value = simulated_states_path[t, s]
+
+                    updated_buffer_ts, updated_count_ts = OnlineQuantileEstimator.update_buffer(
+                         buffer_grid_carry[t, s],
+                         count_grid_carry[t, s],
+                         new_value,
+                         online_smoother_buffer_size
+                    )
+                    
+                    buffer_grid_carry = buffer_grid_carry.at[t, s].set(updated_buffer_ts)
+                    count_grid_carry = count_grid_carry.at[t, s].set(updated_count_ts)
+
+                    return (buffer_grid_carry, count_grid_carry), None # No output per step
+
+                # Create flattened indices (t, s) for the scan
+                ts_indices = jnp.array([(t, s) for t in range(T_obs) for s in range(k_states)])
+
+                # Use a JAX scan to update the entire grid efficiently
+                (buffer_grid, count_grid), _ = jax.lax.scan(
+                     update_estimator_grid_step,
+                     (buffer_grid, count_grid),
+                     ts_indices
+                )
+
+                processed_draws += 1
+                key_idx += 1
+                
+            except Exception as e:
+                 print(f"\nWarning: Failed to run smoother draw {smoother_draw_idx} for MCMC sample {mcmc_draw_idx}: {e}. Skipping.")
+                 results['error'] = f"Smoother draw failed for MCMC sample {mcmc_draw_idx}, draw {smoother_draw_idx}: {e}"
+                 import traceback
+                 traceback.print_exc()
+                 # Ensure key is still consumed even if draw fails to maintain sequence
+                 key_idx += 1
+                 processed_draws += 1 # Still count it as an attempted draw
+                 # Optionally, break the inner loop if a draw fails to avoid cascading errors
+                 # break 
+
+
+        # Optional: Report progress periodically
+        if (mcmc_draw_idx + 1) % 10 == 0 or (mcmc_draw_idx + 1) == num_mcmc_samples:
+             elapsed_time = time.time() - start_smooth_sim_time
+             avg_time_per_mcmc = elapsed_time / (mcmc_draw_idx + 1) if (mcmc_draw_idx + 1) > 0 else 0
+             remaining_mcmc = num_mcmc_samples - (mcmc_draw_idx + 1)
+             estimated_remaining_time = avg_time_per_mcmc * remaining_mcmc if avg_time_per_mcmc > 0 else float('inf')
+             print(f"Processed MCMC sample {mcmc_draw_idx + 1}/{num_mcmc_samples}. "
+                   f"Total draws processed: {processed_draws}/{total_simulation_draws}. "
+                   f"Elapsed: {elapsed_time:.2f}s. Est. remaining: {estimated_remaining_time:.2f}s.")
+
+
+    smooth_sim_time = time.time() - start_smooth_sim_time
+    print(f"\nOnline simulation smoothing completed in {smooth_sim_time:.2f} seconds.")
+    print(f"Successfully processed {processed_draws}/{total_simulation_draws} total simulation draws.")
+
+    # Step 8: Compute Final HDI/Quantiles from collected buffers
+    print(f"\nStep 8: Computing final quantiles and HDI...")
+    
+    final_quantiles_grid = jnp.full(
+        (T_obs, k_states, len(quantiles_to_track)),
+        jnp.nan,
+        dtype=_DEFAULT_DTYPE
+    )
+
+    # We need to compute quantiles for each (t, s) using the final buffer_grid and count_grid.
+    # Use a JAX scan for this over the flattened (t, s) indices.
+    ts_indices = jnp.array([(t, s) for t in range(T_obs) for s in range(k_states)]) # Re-create indices
+
+    def compute_quantiles_grid_step(carry, ts_idx):
+        # carry is the final_quantiles_grid being built
+        # ts_idx is a tuple (t, s)
+        quantiles_grid_carry = carry
+        t, s = ts_idx
+        
+        buffer_ts = buffer_grid[t, s]
+        count_ts = count_grid[t, s]
+        
+        computed_qs = OnlineQuantileEstimator.compute_quantiles_from_buffer(
+            buffer_ts,
+            count_ts,
+            quantiles_to_track
+        )
+        
+        quantiles_grid_carry = quantiles_grid_carry.at[t, s].set(computed_qs)
+
+        return quantiles_grid_carry, None # No output per step
+
+    final_quantiles_grid, _ = jax.lax.scan(
+        compute_quantiles_grid_step,
+        final_quantiles_grid,
+        ts_indices 
+    )
+
+    # Extract median, lower and upper HDI bounds
+    # Find index of each quantile in the sorted quantiles_to_track list
     try:
-        model_eqs_hashable = convert_to_hashable(config_data['parsed_model_eqs_jax_detailed'])
-        measurement_params_hashable = convert_to_hashable([])
+        median_idx = quantiles_to_track.index(0.5)
+        lower_hdi_idx = quantiles_to_track.index(0.025)
+        upper_hdi_idx = quantiles_to_track.index(0.975)
         
-        # CRITICAL FIX: Convert initial conditions to the tuple format expected by smoother
-        # The smoother expects: (state_name, mean_val, var_val)
-        # But we have: {state_name: {'mean': val, 'var': val}}
-        initial_conds_tuple = tuple(
-            (state_name, float(state_config['mean']), float(state_config['var']))
-            for state_name, state_config in config_data['initial_conditions_parsed'].items()
-        )
-        initial_conds_hashable = initial_conds_tuple
-        print(f"Converted initial conditions to tuple format: {len(initial_conds_tuple)} states")
-        
-    except Exception as e:
-        print(f"Error converting to hashable format: {e}")
-        # Fallback: create simplified tuple version
-        initial_conds_tuple = tuple(
-            (state_name, 0.0, 1.0)  # Default values
-            for state_name in config_data['full_state_names_tuple']
-        )
-        initial_conds_hashable = initial_conds_tuple
-        model_eqs_hashable = convert_to_hashable(config_data['model_equations_parsed'])  # Use simpler version
-        measurement_params_hashable = tuple()
-    
-    static_smoother_args = {
-        'static_k_endog': config_data['k_endog'],
-        'static_k_trends': config_data['k_trends'],
-        'static_k_stationary': config_data['k_stationary'],
-        'static_p': config_data['var_order'],
-        'static_k_states': config_data['k_states'],
-        'static_n_trend_shocks': config_data['n_trend_shocks'],
-        'static_n_shocks_state': config_data['k_stationary'] + config_data['n_trend_shocks'],
-        'static_num_off_diag': config_data.get('num_off_diag', 0),
-        'static_off_diag_rows': config_data['static_off_diag_indices'][0],
-        'static_off_diag_cols': config_data['static_off_diag_indices'][1],
-        'static_valid_obs_idx': static_valid_obs_idx,
-        'static_n_obs_actual': static_n_obs_actual,
-        'model_eqs_parsed': model_eqs_hashable,
-        'initial_conds_parsed': initial_conds_hashable,
-        'trend_names_with_shocks': tuple(config_data.get('trend_names_with_shocks', [])),
-        'stationary_var_names': tuple(config_data['variables']['stationary_var_names']),
-        'trend_var_names': tuple(config_data['variables']['trend_names']),
-        'measurement_params_config': measurement_params_hashable,
-        'num_draws': simulation_draws,
-    }
-    
-    smoothed_states_original = None
-    simulation_results = None
-    smooth_time = 0.0
-    
-    try:
-        start_smooth_time = time.time()
-        smoothed_states_original, simulation_results = run_simulation_smoother_single_params_jit(
-            posterior_mean_params,
-            y_data,
-            key_smooth,
-            **static_smoother_args
-        )
-        smooth_time = time.time() - start_smooth_time
-        print(f"Simulation smoother completed in {smooth_time:.2f} seconds")
-        
-    except Exception as e:
-        print(f"\nERROR: Simulation smoother failed: {e}")
-        import traceback
-        traceback.print_exc()
-        # Continue with partial results
-    
-    # Step 7: Package results
-    results = {
-        'config': config_data,
-        'mcmc_results': {
-            'posterior_samples': posterior_samples,
-            'mcmc_time': mcmc_time,
-            'mcmc_summary': mcmc_extras
-        },
-        'smoothing_results': {
-            'smoothed_states': smoothed_states_original,
-            'simulation_results': simulation_results,
-            'smooth_time': smooth_time
-        },
-        'data_info': {
-            'data_shape': y_data.shape,
-            'variable_names': variable_names,
-            'date_range': (data.index[0], data.index[-1])
-        },
-        'parameter_mapping': posterior_mean_params  # Include the fixed mapping
-    }
+        median_draws = final_quantiles_grid[:, :, median_idx]
+        hdi_lower_draws = final_quantiles_grid[:, :, lower_hdi_idx]
+        hdi_upper_draws = final_quantiles_grid[:, :, upper_hdi_idx]
+    except ValueError:
+         print("Warning: Standard quantiles (0.025, 0.5, 0.975) not found in quantiles_to_track. HDI/Median fields will be NaN.")
+         median_draws = jnp.full((T_obs, k_states), jnp.nan, dtype=_DEFAULT_DTYPE)
+         hdi_lower_draws = jnp.full((T_obs, k_states), jnp.nan, dtype=_DEFAULT_DTYPE)
+         hdi_upper_draws = jnp.full((T_obs, k_states), jnp.nan, dtype=_DEFAULT_DTYPE)
+
+
+    # Compute mean from accumulated sums in the buffer (if count > 0)
+    sum_grid = jnp.sum(jnp.nan_to_num(buffer_grid, nan=0.0), axis=-1) # Sum up buffer values (0 for NaNs)
+    # Avoid division by zero: if count is 0, mean is NaN
+    mean_draws = jnp.where(
+        count_grid > 0,
+        sum_grid / jnp.maximum(1, count_grid), # Divide by count, max(1, count) to prevent div by zero
+        jnp.nan # Mean is NaN if no valid data was ever processed
+    )
+    # Also ensure mean is NaN if no draws were processed at all
+    mean_draws = jnp.where(processed_draws > 0, mean_draws, jnp.full_like(mean_draws, jnp.nan))
+
+
+    print("Quantiles, HDI, and Mean computed.")
+
+    # Step 9: Package results
+    # Store the computed quantiles/HDI and possibly the mean
+    results['smoothing_results']['online_smoother_quantiles'] = { # Store the computed quantiles
+                'quantiles_to_track': quantiles_to_track,
+                'estimated_quantiles': final_quantiles_grid, # All computed quantiles
+                'median': median_draws, # Extracted median
+                'hdi_lower': hdi_lower_draws, # Extracted lower HDI bound
+                'hdi_upper': hdi_upper_draws, # Extracted upper HDI bound
+                'mean': mean_draws, # Computed mean
+                'buffer_size': online_smoother_buffer_size,
+                'total_sim_draws_processed': processed_draws
+            }
+    results['smoothing_results']['smooth_sim_time'] = smooth_sim_time
     
     print("\n" + "="*100)
-    if smoothed_states_original is not None:
-        print("ESTIMATION COMPLETED SUCCESSFULLY")
+    if results.get('smoothing_results', {}).get('online_smoother_quantiles', {}).get('estimated_quantiles') is not None:
+        print("ESTIMATION AND ONLINE SMOOTHING COMPLETED SUCCESSFULLY")
     else:
-        print("ESTIMATION COMPLETED WITH SMOOTHER ISSUES")
+        print("ESTIMATION COMPLETED WITH SMOOTHING ISSUES")
     print("="*100)
     
     return results
 
-# --- Enhanced Plotting with I(2) Data Visualization ---
+# --- Enhanced Plotting with I(2) Data Visualization (Adapt plotting) ---
 
 def plot_results_with_canova_dls(results: Dict[str, Any],
                                 data: pd.DataFrame,
@@ -990,14 +1020,21 @@ def plot_results_with_canova_dls(results: Dict[str, Any],
     Enhanced plotting that shows:
     1. Original I(2) levels vs trends
     2. Canova DLS diagnostics
-    3. Estimated states and fitted values
+    3. Estimated states and fitted values (using online smoother results)
     """
     
     if save_plots and not os.path.exists(plot_dir):
         os.makedirs(plot_dir)
     
+    # Ensure config and data_info are available
     config = results.get('config')
-    variable_names = results['data_info']['variable_names']
+    data_info = results.get('data_info')
+
+    if not config or not data_info:
+        print("Cannot plot results: config or data_info is missing.")
+        return
+
+    variable_names = data_info['variable_names']
     dates = data.index
     
     # Plot 1: I(2) Levels and Growth Rates (if available)
@@ -1019,7 +1056,7 @@ def plot_results_with_canova_dls(results: Dict[str, Any],
                 axes[i, 0].grid(True, alpha=0.3)
             
             # Plot growth rates (first differences)
-            axes[i, 1].plot(dates, data[var_name], 'r-', label='Growth Rate (First Diff)', alpha=0.7)
+            axes[i, 1].plot(dates, data[var_name], 'r-', label='Growth Rate (Estimation Data)', alpha=0.8, linewidth=1.5)
             axes[i, 1].set_title(f'{var_name} - Growth Rate (Estimation Data)')
             axes[i, 1].legend()
             axes[i, 1].grid(True, alpha=0.3)
@@ -1050,166 +1087,304 @@ def plot_results_with_canova_dls(results: Dict[str, Any],
                 axes = axes.reshape(1, -1)
             
             for i, var_name in enumerate(vars_with_dls):
-                diagnostics = dls_results[var_name]['diagnostics']
-                dls_dates = data.index[:len(diagnostics['trend_component'])]
-                
-                # Plot Canova trend
-                ax_trend = axes[i, 0]
-                ax_trend.plot(dls_dates, diagnostics['trend_component'], 'b-', 
-                             label=f'Canova Trend (λ={diagnostics["optimal_lambda"]:.2e})', alpha=0.8)
-                ax_trend.set_title(f'{var_name} - Canova DLS Trend')
-                ax_trend.legend()
-                ax_trend.grid(True, alpha=0.3)
-                
-                # Plot Canova cycle
-                ax_cycle = axes[i, 1]
-                ax_cycle.plot(dls_dates, diagnostics['cycle_component'], 'r-', 
-                             label='Canova Cycle', alpha=0.8)
-                ax_cycle.set_title(f'{var_name} - Canova DLS Cycle')
-                ax_cycle.legend()
-                ax_cycle.grid(True, alpha=0.3)
-                
-                # Format dates
-                for ax in [ax_trend, ax_cycle]:
-                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-                    ax.xaxis.set_major_locator(mdates.YearLocator(5))
-                    if i == len(vars_with_dls) - 1:
-                        ax.tick_params(axis='x', rotation=45)
-                    else:
-                        ax.tick_params(axis='x', labelbottom=False)
+                diagnostics = dls_results[var_name].get('diagnostics') # Use .get for safety
+                if diagnostics: # Plot only if diagnostics exist
+                     dls_dates = data.index[:len(diagnostics.get('trend_component', []))] # Use .get with default empty list
+                     
+                     # Plot Canova trend
+                     ax_trend = axes[i, 0]
+                     trend_comp = diagnostics.get('trend_component')
+                     optimal_lambda = diagnostics.get('optimal_lambda', np.nan)
+                     if trend_comp is not None:
+                         ax_trend.plot(dls_dates, trend_comp, 'b-', 
+                                      label=f'Canova Trend (λ={optimal_lambda:.2e})', alpha=0.8)
+                     ax_trend.set_title(f'{var_name} - Canova DLS Trend')
+                     ax_trend.legend()
+                     ax_trend.grid(True, alpha=0.3)
+                     
+                     # Plot Canova cycle
+                     ax_cycle = axes[i, 1]
+                     cycle_comp = diagnostics.get('cycle_component')
+                     if cycle_comp is not None:
+                          ax_cycle.plot(dls_dates, cycle_comp, 'r-', 
+                                       label='Canova Cycle', alpha=0.8)
+                     ax_cycle.set_title(f'{var_name} - Canova DLS Cycle')
+                     ax_cycle.legend()
+                     ax_cycle.grid(True, alpha=0.3)
+                     
+                     # Format dates
+                     for ax in [ax_trend, ax_cycle]:
+                         ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+                         ax.xaxis.set_major_locator(mdates.YearLocator(5))
+                         if i == len(vars_with_dls) - 1:
+                             ax.tick_params(axis='x', rotation=45)
+                         else:
+                             ax.tick_params(axis='x', labelbottom=False)
             
             plt.tight_layout()
             if save_plots:
                 plt.savefig(f"{plot_dir}/canova_dls_diagnostics.png", dpi=300, bbox_inches='tight')
             plt.show()
     
-    # Plot 3: Estimated States (if smoother succeeded)
+    # Plot 3: Estimated States and HDI (using online smoother results)
     smoothing_results = results.get('smoothing_results')
-    if smoothing_results and smoothing_results.get('smoothed_states') is not None:
-        print("Plotting estimated states...")
-        smoothed_states = smoothing_results['smoothed_states']
-        simulation_results = smoothing_results.get('simulation_results')
+    if smoothing_results and 'online_smoother_quantiles' in smoothing_results:
+        print("Plotting estimated states (median and HDI)...")
         
-        full_state_names = config['full_state_names_tuple']
-        state_indices = {name: i for i, name in enumerate(full_state_names)}
+        online_results = smoothing_results['online_smoother_quantiles']
+        # Ensure these keys exist before accessing
+        median_states = online_results.get('median')
+        hdi_lower = online_results.get('hdi_lower')
+        hdi_upper = online_results.get('hdi_upper')
+        mean_states = online_results.get('mean')
         
-        # Plot trends and cycles
-        fig, axes = plt.subplots(len(variable_names), 2, figsize=(15, 4*len(variable_names)))
-        if len(variable_names) == 1:
-            axes = axes.reshape(1, -1)
+        # Baseline RTS smooth on posterior mean (for comparison)
+        smoothed_states_rts = smoothing_results.get('smoothed_states_original_mean_rts')
         
-        for i, var_name in enumerate(variable_names):
-            # Plot trend
-            trend_name = f'trend_{var_name}'
-            if trend_name in state_indices:
-                trend_idx = state_indices[trend_name]
-                axes[i, 0].plot(dates, smoothed_states[:, trend_idx], 'b-', 
-                               label='Estimated Trend', linewidth=1.5, alpha=0.8)
-                
-                # Add simulation bands if available
-                if simulation_results and len(simulation_results) == 3:
-                    mean_sim, median_sim, all_draws = simulation_results
-                    if trend_idx < mean_sim.shape[1]:
-                        axes[i, 0].plot(dates, mean_sim[:, trend_idx], 'r:', 
-                                       label='Simulation Mean', linewidth=1.5)
-                        
-                        if all_draws is not None and all_draws.shape[0] > 1:
-                            try:
-                                lower = jnp.percentile(all_draws[:, :, trend_idx], 10, axis=0)
-                                upper = jnp.percentile(all_draws[:, :, trend_idx], 90, axis=0)
-                                axes[i, 0].fill_between(dates, lower, upper, 
-                                                       color='red', alpha=0.2, label='80% Band')
-                            except:
-                                pass
-                
-                axes[i, 0].set_title(f'{var_name} - Estimated Trend')
-                axes[i, 0].legend()
-                axes[i, 0].grid(True, alpha=0.3)
+        # Check if median_states exists and has expected dimensions
+        if median_states is not None and median_states.shape == (data.shape[0], config['k_states']):
+             
+            full_state_names = config['full_state_names_tuple']
+            # state_indices = {name: i for i, name in enumerate(full_state_names)} # Not needed here
+
+            # Plot trends and cycles (only current state components)
+            # Determine which states are trends and which are current cycles
+            trend_names = config['trend_var_names']
+            current_cycle_names = config['stationary_var_names']
             
-            # Plot cycle
-            cycle_name = f'cycle_{var_name}'
-            if cycle_name in state_indices:
-                cycle_idx = state_indices[cycle_name]
-                axes[i, 1].plot(dates, smoothed_states[:, cycle_idx], 'g-',
-                               label='Estimated Cycle', linewidth=1.5, alpha=0.8)
-                
-                # Add simulation bands if available
-                if simulation_results and len(simulation_results) == 3:
-                    mean_sim, median_sim, all_draws = simulation_results
-                    if cycle_idx < mean_sim.shape[1]:
-                        axes[i, 1].plot(dates, mean_sim[:, cycle_idx], 'r:',
-                                       label='Simulation Mean', linewidth=1.5)
-                        
-                        if all_draws is not None and all_draws.shape[0] > 1:
-                            try:
-                                lower = jnp.percentile(all_draws[:, :, cycle_idx], 10, axis=0)
-                                upper = jnp.percentile(all_draws[:, :, cycle_idx], 90, axis=0)
-                                axes[i, 1].fill_between(dates, lower, upper,
-                                                       color='red', alpha=0.2, label='80% Band')
-                            except:
-                                pass
-                
-                axes[i, 1].set_title(f'{var_name} - Estimated Cycle')
-                axes[i, 1].legend()
-                axes[i, 1].grid(True, alpha=0.3)
+            fig, axes = plt.subplots(len(variable_names), 2, figsize=(15, 4*len(variable_names)))
+            if len(variable_names) == 1:
+                axes = axes.reshape(1, -1)
             
-            # Format dates
-            for ax in axes[i, :]:
+            # Get indices of trends and current cycles in the full state vector
+            trend_indices_in_full_state = [full_state_names.index(name) for name in trend_names]
+            current_cycle_indices_in_full_state = [full_state_names.index(name) for name in current_cycle_names]
+
+
+            for i, var_name in enumerate(variable_names):
+                # Plot trend
+                ax_trend = axes[i, 0]
+                
+                trend_idx = trend_indices_in_full_state[i] # Assuming order matches variable_names
+
+                ax_trend.plot(dates, median_states[:, trend_idx], 'g-', 
+                               label='Smoother Median', linewidth=1.5, alpha=0.8)
+                if mean_states is not None:
+                    ax_trend.plot(dates, mean_states[:, trend_idx], 'r:',
+                                  label='Smoother Mean', linewidth=1.5, alpha=0.8)
+                
+                if hdi_lower is not None and hdi_upper is not None:
+                     ax_trend.fill_between(dates, hdi_lower[:, trend_idx], hdi_upper[:, trend_idx], 
+                                           color='green', alpha=0.2, label='Estimated HDI')
+                
+                if smoothed_states_rts is not None:
+                     ax_trend.plot(dates, smoothed_states_rts[:, trend_idx], 'k--',
+                                   label='RTS (Posterior Mean)', linewidth=1.5, alpha=0.6)
+                                   
+                ax_trend.set_title(f'{var_name} - Estimated Trend')
+                ax_trend.legend()
+                ax_trend.grid(True, alpha=0.3)
+            
+                # Plot cycle (current cycle)
+                ax_cycle = axes[i, 1]
+                
+                cycle_idx = current_cycle_indices_in_full_state[i] # Assuming order matches variable_names
+
+                ax_cycle.plot(dates, median_states[:, cycle_idx], 'g-',
+                               label='Smoother Median', linewidth=1.5, alpha=0.8)
+                if mean_states is not None:
+                     ax_cycle.plot(dates, mean_states[:, cycle_idx], 'r:',
+                                   label='Smoother Mean', linewidth=1.5, alpha=0.8)
+                                   
+                if hdi_lower is not None and hdi_upper is not None:
+                     ax_cycle.fill_between(dates, hdi_lower[:, cycle_idx], hdi_upper[:, cycle_idx],
+                                           color='green', alpha=0.2, label='Estimated HDI')
+
+                if smoothed_states_rts is not None:
+                     ax_cycle.plot(dates, smoothed_states_rts[:, cycle_idx], 'k--',
+                                   label='RTS (Posterior Mean)', linewidth=1.5, alpha=0.6)
+
+                ax_cycle.set_title(f'{var_name} - Estimated Cycle')
+                ax_cycle.legend()
+                ax_cycle.grid(True, alpha=0.3)
+            
+                # Format dates
+                for ax in [axes[i, 0], axes[i, 1]]: # Format both axes for this variable
+                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+                    ax.xaxis.set_major_locator(mdates.YearLocator(10))
+                    if i == len(variable_names) - 1:
+                        ax.tick_params(axis='x', rotation=45)
+                    else:
+                        ax.tick_params(axis='x', labelbottom=False)
+            
+            plt.tight_layout()
+            if save_plots:
+                plt.savefig(f"{plot_dir}/estimated_states_hdi.png", dpi=300, bbox_inches='tight')
+            plt.show()
+        else:
+             print("Smoother median/mean states not available for plotting fitted values.")
+
+        # Plot 4: Data vs Fitted Values (using estimated mean/median states)
+        if median_states is not None and median_states.shape[0] == data.shape[0]:
+            print("Plotting data vs fitted values (median)...")
+            fig, axes = plt.subplots(len(variable_names), 1, figsize=(15, 3*len(variable_names)))
+            if len(variable_names) == 1:
+                axes = [axes]
+            
+            # Need a mapping from state name string to full state vector index (including lags)
+            full_state_names = config['full_state_names_tuple']
+            state_indices_full = {name: i for i, name in enumerate(full_state_names)}
+
+            # Need mean of measurement parameters if they exist (for fitted values)
+            measurement_param_names_tuple = config['measurement_param_names_tuple']
+            measurement_param_means = {}
+            mcmc_results = results.get('mcmc_results')
+            if mcmc_results and mcmc_results.get('posterior_samples'):
+                 posterior_samples = mcmc_results['posterior_samples']
+                 for param_name in measurement_param_names_tuple:
+                      if param_name in posterior_samples:
+                            # Use mean of sampled measurement params
+                            mean_val = jnp.mean(posterior_samples[param_name], axis=0)
+                            # Ensure mean_val is a JAX array, handle potential scalar case
+                            measurement_param_means[param_name] = jnp.asarray(mean_val, dtype=_DEFAULT_DTYPE)
+                      else:
+                            # Fallback if parameter not found (should be handled by config parsing warnings)
+                            print(f"Warning: Measurement parameter '{param_name}' not found for plotting fitted values. Using 0.0.")
+                            measurement_param_means[param_name] = jnp.array(0.0, dtype=_DEFAULT_DTYPE)
+
+            # Get the parsed model equations details from config_data
+            parsed_model_eqs_for_model = config['model_equations_parsed'] # List of (obs_idx, List[Tuple[param_name, state_name, sign]])
+
+
+            for i, var_name in enumerate(variable_names):
+                ax = axes[i]
+                # Original data
+                ax.plot(dates, data[var_name], 'k-', label='Observed Data', alpha=0.8, linewidth=1.5)
+                
+                # Compute fitted values using median states and mean measurement parameters
+                fitted_values_median = jnp.zeros(data.shape[0], dtype=_DEFAULT_DTYPE)
+                
+                # Iterate through the parsed equation terms for this observable (obs_idx == i)
+                terms_for_this_obs = None
+                for obs_idx_check, terms_list in parsed_model_eqs_for_model:
+                     if obs_idx_check == i:
+                          terms_for_this_obs = terms_list
+                          break
+
+                if terms_for_this_obs is not None:
+                    for param_name, state_name_in_eq, sign in terms_for_this_obs:
+                        # state_name_in_eq is the string name (e.g., 'trend_gdp_growth', 'cycle_gdp_growth')
+                        full_state_idx = state_indices_full[state_name_in_eq] # Map name to full state index
+                        
+                        if param_name is None: # Direct state term
+                            fitted_values_median += sign * median_states[:, full_state_idx]
+                        else: # Parameter * state term
+                            param_value = measurement_param_means.get(param_name, jnp.array(0.0, dtype=_DEFAULT_DTYPE)) # Get mean parameter value
+                            fitted_values_median += sign * param_value * median_states[:, full_state_idx]
+
+                ax.plot(dates, fitted_values_median, 'r--', label='Fitted (Median States, Mean Params)', alpha=0.8, linewidth=1.5)
+
+                # Optional: Plot fitted values using mean states and mean measurement parameters
+                if mean_states is not None and mean_states.shape == (data.shape[0], config['k_states']):
+                    fitted_values_mean_states = jnp.zeros(data.shape[0], dtype=_DEFAULT_DTYPE)
+                    if terms_for_this_obs is not None:
+                         for param_name, state_name_in_eq, sign in terms_for_this_obs:
+                              full_state_idx = state_indices_full[state_name_in_eq]
+                              if param_name is None:
+                                   fitted_values_mean_states += sign * mean_states[:, full_state_idx]
+                              else:
+                                   param_value = measurement_param_means.get(param_name, jnp.array(0.0, dtype=_DEFAULT_DTYPE))
+                                   fitted_values_mean_states += sign * param_value * mean_states[:, full_state_idx]
+                                   
+                    ax.plot(dates, fitted_values_mean_states, 'b:', label='Fitted (Mean States, Mean Params)', alpha=0.6, linewidth=1.5)
+
+
+                ax.set_title(f'{var_name} - Observed vs Fitted')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
                 ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
                 ax.xaxis.set_major_locator(mdates.YearLocator(10))
+                
                 if i == len(variable_names) - 1:
                     ax.tick_params(axis='x', rotation=45)
                 else:
                     ax.tick_params(axis='x', labelbottom=False)
-        
-        plt.tight_layout()
-        if save_plots:
-            plt.savefig(f"{plot_dir}/estimated_states.png", dpi=300, bbox_inches='tight')
-        plt.show()
-        
-        # Plot 4: Data vs Fitted Values
-        print("Plotting data vs fitted values...")
-        fig, axes = plt.subplots(len(variable_names), 1, figsize=(15, 3*len(variable_names)))
-        if len(variable_names) == 1:
-            axes = [axes]
-        
-        for i, var_name in enumerate(variable_names):
-            # Original data
-            axes[i].plot(dates, data[var_name], 'k-', label='Observed Data', alpha=0.8, linewidth=1.5)
             
-            # Compute fitted values (trend + cycle)
-            trend_name = f'trend_{var_name}'
-            cycle_name = f'cycle_{var_name}'
-            
-            if trend_name in state_indices and cycle_name in state_indices:
-                trend_idx = state_indices[trend_name]
-                cycle_idx = state_indices[cycle_name]
-                fitted_values = smoothed_states[:, trend_idx] + smoothed_states[:, cycle_idx]
-                axes[i].plot(dates, fitted_values, 'r--', label='Fitted Values', alpha=0.8, linewidth=1.5)
-            
-            axes[i].set_title(f'{var_name} - Observed vs Fitted')
-            axes[i].legend()
-            axes[i].grid(True, alpha=0.3)
-            axes[i].xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-            axes[i].xaxis.set_major_locator(mdates.YearLocator(10))
-            
-            if i == len(variable_names) - 1:
-                axes[i].tick_params(axis='x', rotation=45)
-            else:
-                axes[i].tick_params(axis='x', labelbottom=False)
-        
-        plt.tight_layout()
-        if save_plots:
-            plt.savefig(f"{plot_dir}/data_vs_fitted.png", dpi=300, bbox_inches='tight')
-        plt.show()
+            plt.tight_layout()
+            if save_plots:
+                plt.savefig(f"{plot_dir}/data_vs_fitted_online_smoother.png", dpi=300, bbox_inches='tight')
+            plt.show()
+        else:
+             print("Smoother median/mean states not available for plotting fitted values.")
 
-# --- Example Usage with I(2) Data ---
 
+    # Print summary (Keep this section as is, but ensure keys exist)
+    if results and results.get('mcmc_results'):
+        print("\n" + "="*80)
+        print("ESTIMATION SUMMARY")
+        print("="*80)
+        
+        config_data = results.get('config')
+        if config_data and 'canova_dls_results' in config_data:
+            print("\nCanova DLS Prior Information:")
+            for var_name, dls_info in config_data['canova_dls_results'].items():
+                diag = dls_info.get('diagnostics')
+                if diag:
+                     print(f"  {var_name}:")
+                     print(f"    Optimal λ: {diag.get('optimal_lambda', np.nan):.2e}")
+                     print(f"    Trend variance: {diag.get('extracted_trend_var', np.nan):.6f}")
+                     print(f"    Cycle variance: {diag.get('extracted_cycle_var', np.nan):.6f}")
+        
+        smoothing_results = results.get('smoothing_results', {})
+        online_smooth_info = smoothing_results.get('online_smoother_quantiles')
+        
+        print(f"\nOnline Simulation Smoothing Info:")
+        if online_smooth_info:
+            print(f"  Quantiles tracked: {online_smooth_info.get('quantiles_to_track', 'N/A')}")
+            print(f"  Buffer size per (t, s): {online_smooth_info.get('buffer_size', 'N/A')}")
+            print(f"  Total simulation draws processed: {online_smooth_info.get('total_sim_draws_processed', 0)}")
+            # Print a sample of median/HDI for the first few time steps/states
+            print("\nSample Smoother Estimates (Time 0, State 0 & 1):")
+            median_draws = online_smooth_info.get('median')
+            hdi_lower_draws = online_smooth_info.get('hdi_lower')
+            hdi_upper_draws = online_smooth_info.get('hdi_upper')
+            mean_draws = online_smooth_info.get('mean') # Also get mean
+            full_state_names = config_data.get('full_state_names_tuple') # Get from config_data
+            
+            if median_draws is not None and full_state_names is not None:
+                if median_draws.shape[0] > 0 and median_draws.shape[1] > 0:
+                    state_name_0 = full_state_names[0] if len(full_state_names) > 0 else "State 0"
+                    median_0 = median_draws[0, 0] if median_draws.shape[1] > 0 else np.nan
+                    lower_0 = hdi_lower_draws[0, 0] if hdi_lower_draws is not None and hdi_lower_draws.shape[1] > 0 else np.nan
+                    upper_0 = hdi_upper_draws[0, 0] if hdi_upper_draws is not None and hdi_upper_draws.shape[1] > 0 else np.nan
+                    mean_0 = mean_draws[0, 0] if mean_draws is not None and mean_draws.shape[1] > 0 else np.nan
+                    print(f"  {state_name_0}: Median={float(median_0):.4f}, Mean={float(mean_0):.4f}, 95% HDI=[{float(lower_0):.4f}, {float(upper_0):.4f}]")
+
+                if median_draws.shape[0] > 0 and median_draws.shape[1] > 1:
+                    state_name_1 = full_state_names[1] if len(full_state_names) > 1 else "State 1"
+                    median_1 = median_draws[0, 1] if median_draws.shape[1] > 1 else np.nan
+                    lower_1 = hdi_lower_draws[0, 1] if hdi_lower_draws is not None and hdi_lower_draws.shape[1] > 1 else np.nan
+                    upper_1 = hdi_upper_draws[0, 1] if hdi_upper_draws is not None and hdi_upper_draws.shape[1] > 1 else np.nan
+                    mean_1 = mean_draws[0, 1] if mean_draws is not None and mean_draws.shape[1] > 1 else np.nan
+                    print(f"  {state_name_1}: Median={float(median_1):.4f}, Mean={float(mean_1):.4f}, 95% HDI=[{float(lower_1):.4f}, {float(upper_1):.4f}]")
+
+        else:
+            print("  Online simulation smoothing results not available.")
+
+        if results.get('error'):
+             print(f"\nErrors encountered during estimation: {results['error']}")
+
+        return results
+    else:
+        print("Estimation failed!")
+        return None
+
+# *** RESTORED function definition ***
 def example_with_i2_data():
     """Example using I(2) simulated data with all fixes."""
     
     # Create sample I(2) data
-    dates = pd.date_range('1960-01-01', periods=200, freq='Q')
+    dates = pd.date_range('1960-01-01', periods=200, freq='QE')
     
     print("Creating I(2) sample data...")
     data = simulate_i2_economic_data(dates, ['gdp_growth', 'inflation'], seed=42)
@@ -1228,7 +1403,7 @@ def example_with_i2_data():
         var_order=1,
         mcmc_params={
             'num_warmup': 200,
-            'num_samples': 300,
+            'num_samples': 300, # Reduced for quicker example
             'num_chains': 2
         },
         dls_params={
@@ -1236,9 +1411,10 @@ def example_with_i2_data():
             'smoothness_range': (1e-6, 1e2),
             'alpha_shape': 2.5,
         },
-        simulation_draws=50,
+        simulation_draws_per_mcmc=50, # Number of smoother draws per MCMC sample
+        online_smoother_buffer_size=500, # Buffer size (should be > simulation_draws_per_mcmc)
         save_config=True,
-        config_filename='bvar_canova_dls_fixed.yml'
+        config_filename='bvar_canova_dls_fixed_online.yml'
     )
     
     # Create comprehensive plots
@@ -1246,41 +1422,73 @@ def example_with_i2_data():
         results=results,
         data=data,
         save_plots=True,
-        plot_dir='estimation_plots_fixed'
+        plot_dir='estimation_plots_online_smoother'
     )
     
     # Print summary
     if results and results.get('mcmc_results'):
-        posterior = results['mcmc_results']['posterior_samples']
+        # Posterior samples are still in the results dictionary for inspection if needed
+        # posterior = results['mcmc_results']['posterior_samples']
         print("\n" + "="*80)
         print("ESTIMATION SUMMARY")
         print("="*80)
         
-        if 'parameter_mapping' in results:
-            print("\nParameter Mapping (MCMC -> Smoother):")
-            for param_name, param_value in results['parameter_mapping'].items():
-                if isinstance(param_value, jnp.ndarray):
-                    if param_value.ndim == 0:
-                        print(f"  {param_name}: {float(param_value):.6f}")
-                    else:
-                        print(f"  {param_name}: shape={param_value.shape}, mean={jnp.mean(param_value):.6f}")
-        
-        if 'canova_dls_results' in results['config']:
+        config_data = results.get('config')
+        if config_data and 'canova_dls_results' in config_data:
             print("\nCanova DLS Prior Information:")
-            for var_name, dls_info in results['config']['canova_dls_results'].items():
-                diag = dls_info['diagnostics']
-                print(f"  {var_name}:")
-                print(f"    Optimal λ: {diag['optimal_lambda']:.2e}")
-                print(f"    Trend variance: {diag['extracted_trend_var']:.6f}")
-                print(f"    Cycle variance: {diag['extracted_cycle_var']:.6f}")
+            for var_name, dls_info in config_data['canova_dls_results'].items():
+                diag = dls_info.get('diagnostics')
+                if diag:
+                     print(f"  {var_name}:")
+                     print(f"    Optimal λ: {diag.get('optimal_lambda', np.nan):.2e}")
+                     print(f"    Trend variance: {diag.get('extracted_trend_var', np.nan):.6f}")
+                     print(f"    Cycle variance: {diag.get('extracted_cycle_var', np.nan):.6f}")
         
-        smoothing_success = results.get('smoothing_results', {}).get('smoothed_states') is not None
-        print(f"\nSmoothing Success: {smoothing_success}")
+        smoothing_results = results.get('smoothing_results', {})
+        online_smooth_info = smoothing_results.get('online_smoother_quantiles')
         
+        print(f"\nOnline Simulation Smoothing Info:")
+        if online_smooth_info:
+            print(f"  Quantiles tracked: {online_smooth_info.get('quantiles_to_track', 'N/A')}")
+            print(f"  Buffer size per (t, s): {online_smooth_info.get('buffer_size', 'N/A')}")
+            print(f"  Total simulation draws processed: {online_smooth_info.get('total_sim_draws_processed', 0)}")
+            # Print a sample of median/HDI for the first few time steps/states
+            print("\nSample Smoother Estimates (Time 0, State 0 & 1):")
+            median_draws = online_smooth_info.get('median')
+            hdi_lower_draws = online_smooth_info.get('hdi_lower')
+            hdi_upper_draws = online_smooth_info.get('hdi_upper')
+            mean_draws = online_smooth_info.get('mean') # Also get mean
+            full_state_names = config_data.get('full_state_names_tuple') # Get from config_data
+            
+            if median_draws is not None and full_state_names is not None:
+                if median_draws.shape[0] > 0 and median_draws.shape[1] > 0:
+                    state_name_0 = full_state_names[0] if len(full_state_names) > 0 else "State 0"
+                    median_0 = median_draws[0, 0] if median_draws.shape[1] > 0 else np.nan
+                    lower_0 = hdi_lower_draws[0, 0] if hdi_lower_draws is not None and hdi_lower_draws.shape[1] > 0 else np.nan
+                    upper_0 = hdi_upper_draws[0, 0] if hdi_upper_draws is not None and hdi_upper_draws.shape[1] > 0 else np.nan
+                    mean_0 = mean_draws[0, 0] if mean_draws is not None and mean_draws.shape[1] > 0 else np.nan
+                    print(f"  {state_name_0}: Median={float(median_0):.4f}, Mean={float(mean_0):.4f}, 95% HDI=[{float(lower_0):.4f}, {float(upper_0):.4f}]")
+
+                if median_draws.shape[0] > 0 and median_draws.shape[1] > 1:
+                    state_name_1 = full_state_names[1] if len(full_state_names) > 1 else "State 1"
+                    median_1 = median_draws[0, 1] if median_draws.shape[1] > 1 else np.nan
+                    lower_1 = hdi_lower_draws[0, 1] if hdi_lower_draws is not None and hdi_lower_draws.shape[1] > 1 else np.nan
+                    upper_1 = hdi_upper_draws[0, 1] if hdi_upper_draws is not None and hdi_upper_draws.shape[1] > 1 else np.nan
+                    mean_1 = mean_draws[0, 1] if mean_draws is not None and mean_draws.shape[1] > 1 else np.nan
+                    print(f"  {state_name_1}: Median={float(median_1):.4f}, Mean={float(mean_1):.4f}, 95% HDI=[{float(lower_1):.4f}, {float(upper_1):.4f}]")
+
+        else:
+            print("  Online simulation smoothing results not available.")
+
+        if results.get('error'):
+             print(f"\nErrors encountered during estimation: {results['error']}")
+
         return results
     else:
         print("Estimation failed!")
         return None
 
+
 if __name__ == "__main__":
+    # *** ENSURE THE FUNCTION DEFINITION IS ABOVE THIS BLOCK ***
     results = example_with_i2_data()
